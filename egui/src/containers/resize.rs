@@ -1,7 +1,7 @@
 use crate::*;
 
 #[derive(Clone, Copy, Debug)]
-#[cfg_attr(feature = "persistence", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub(crate) struct State {
     /// This is the size that the user has picked by dragging the resize handles.
     /// This may be smaller and/or larger than the actual size.
@@ -16,8 +16,19 @@ pub(crate) struct State {
     pub(crate) requested_size: Option<Vec2>,
 }
 
+impl State {
+    pub fn load(ctx: &Context, id: Id) -> Option<Self> {
+        ctx.memory().data.get_persisted(id)
+    }
+
+    pub fn store(self, ctx: &Context, id: Id) {
+        ctx.memory().data.insert_persisted(id, self);
+    }
+}
+
 /// A region that can be resized by dragging the bottom right corner.
 #[derive(Clone, Copy, Debug)]
+#[must_use = "You should call .show()"]
 pub struct Resize {
     id: Option<Id>,
     id_source: Option<Id>,
@@ -159,7 +170,7 @@ impl Resize {
             ui.make_persistent_id(id_source)
         });
 
-        let mut state = ui.memory().resize.get(&id).cloned().unwrap_or_else(|| {
+        let mut state = State::load(ui.ctx(), id).unwrap_or_else(|| {
             ui.ctx().request_repaint(); // counter frame delay
 
             let default_size = self
@@ -281,12 +292,11 @@ impl Resize {
         if self.with_stroke && corner_response.is_some() {
             let rect = Rect::from_min_size(content_ui.min_rect().left_top(), state.desired_size);
             let rect = rect.expand(2.0); // breathing room for content
-            ui.painter().add(epaint::Shape::Rect {
+            ui.painter().add(Shape::rect_stroke(
                 rect,
-                corner_radius: 3.0,
-                fill: Default::default(),
-                stroke: ui.visuals().widgets.noninteractive.bg_stroke,
-            });
+                3.0,
+                ui.visuals().widgets.noninteractive.bg_stroke,
+            ));
         }
 
         if let Some(corner_response) = corner_response {
@@ -297,9 +307,9 @@ impl Resize {
             }
         }
 
-        ui.memory().resize.insert(id, state);
+        state.store(ui.ctx(), id);
 
-        if ui.ctx().style().visuals.debug_resize {
+        if ui.ctx().style().debug.show_resize {
             ui.ctx().debug_painter().debug_rect(
                 Rect::from_min_size(content_ui.min_rect().left_top(), state.desired_size),
                 Color32::GREEN,
@@ -318,17 +328,20 @@ use epaint::Stroke;
 
 pub fn paint_resize_corner(ui: &mut Ui, response: &Response) {
     let stroke = ui.style().interact(response).fg_stroke;
-    paint_resize_corner_with_style(ui, &response.rect, stroke);
+    paint_resize_corner_with_style(ui, &response.rect, stroke, Align2::RIGHT_BOTTOM);
 }
 
-pub fn paint_resize_corner_with_style(ui: &mut Ui, rect: &Rect, stroke: Stroke) {
+pub fn paint_resize_corner_with_style(ui: &mut Ui, rect: &Rect, stroke: Stroke, corner: Align2) {
     let painter = ui.painter();
-    let corner = painter.round_pos_to_pixels(rect.right_bottom());
+    let cp = painter.round_pos_to_pixels(corner.pos_in_rect(rect));
     let mut w = 2.0;
 
     while w <= rect.width() && w <= rect.height() {
         painter.line_segment(
-            [pos2(corner.x - w, corner.y), pos2(corner.x, corner.y - w)],
+            [
+                pos2(cp.x - w * corner.x().to_sign(), cp.y),
+                pos2(cp.x, cp.y - w * corner.y().to_sign()),
+            ],
             stroke,
         );
         w += 4.0;

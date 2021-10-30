@@ -2,7 +2,7 @@
 
 /// Character cursor
 #[derive(Clone, Copy, Debug, Default)]
-#[cfg_attr(feature = "persistence", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct CCursor {
     /// Character offset (NOT byte offset!).
     pub index: usize,
@@ -51,9 +51,21 @@ impl std::ops::Sub<usize> for CCursor {
     }
 }
 
+impl std::ops::AddAssign<usize> for CCursor {
+    fn add_assign(&mut self, rhs: usize) {
+        self.index = self.index.saturating_add(rhs);
+    }
+}
+
+impl std::ops::SubAssign<usize> for CCursor {
+    fn sub_assign(&mut self, rhs: usize) {
+        self.index = self.index.saturating_sub(rhs);
+    }
+}
+
 /// Row Cursor
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-#[cfg_attr(feature = "persistence", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct RCursor {
     /// 0 is first row, and so on.
     /// Note that a single paragraph can span multiple rows.
@@ -68,7 +80,7 @@ pub struct RCursor {
 
 /// Paragraph Cursor
 #[derive(Clone, Copy, Debug, Default)]
-#[cfg_attr(feature = "persistence", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct PCursor {
     /// 0 is first paragraph, and so on.
     /// Note that a single paragraph can span multiple rows.
@@ -100,7 +112,7 @@ impl PartialEq for PCursor {
 /// pcursor/rcursor can also point to after the end of the paragraph/row.
 /// Does not implement `PartialEq` because you must think which cursor should be equivalent.
 #[derive(Clone, Copy, Debug, Default)]
-#[cfg_attr(feature = "persistence", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct Cursor {
     pub ccursor: CCursor,
     pub rcursor: RCursor,

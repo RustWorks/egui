@@ -25,43 +25,60 @@ use crate::*;
 pub struct SelectableLabel {
     selected: bool,
     text: String,
+    text_style: Option<TextStyle>,
 }
 
 impl SelectableLabel {
-    pub fn new(selected: bool, text: impl Into<String>) -> Self {
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn new(selected: bool, text: impl ToString) -> Self {
         Self {
             selected,
-            text: text.into(),
+            text: text.to_string(),
+            text_style: None,
         }
+    }
+
+    pub fn text_style(mut self, text_style: TextStyle) -> Self {
+        self.text_style = Some(text_style);
+        self
     }
 }
 
 impl Widget for SelectableLabel {
     fn ui(self, ui: &mut Ui) -> Response {
-        let Self { selected, text } = self;
+        let Self {
+            selected,
+            text,
+            text_style,
+        } = self;
 
-        let text_style = TextStyle::Button;
-        let font = &ui.fonts()[text_style];
+        let text_style = text_style
+            .or(ui.style().override_text_style)
+            .unwrap_or(TextStyle::Button);
 
         let button_padding = ui.spacing().button_padding;
         let total_extra = button_padding + button_padding;
 
-        let galley = if ui.wrap_text() {
-            font.layout_multiline(text, ui.available_width() - total_extra.x)
+        let wrap_width = if ui.wrap_text() {
+            ui.available_width() - total_extra.x
         } else {
-            font.layout_no_wrap(text)
+            f32::INFINITY
         };
 
-        let mut desired_size = total_extra + galley.size;
+        let galley = ui
+            .fonts()
+            .layout_delayed_color(text, text_style, wrap_width);
+
+        let mut desired_size = total_extra + galley.size();
         desired_size.y = desired_size.y.at_least(ui.spacing().interact_size.y);
         let (rect, response) = ui.allocate_at_least(desired_size, Sense::click());
         response.widget_info(|| {
-            WidgetInfo::selected(WidgetType::SelectableLabel, selected, &galley.text)
+            WidgetInfo::selected(WidgetType::SelectableLabel, selected, galley.text())
         });
 
-        let text_cursor = ui
+        let text_pos = ui
             .layout()
-            .align_size_within_rect(galley.size, rect.shrink2(button_padding))
+            .align_size_within_rect(galley.size(), rect.shrink2(button_padding))
             .min;
 
         let visuals = ui.style().interact_selectable(&response, selected);
@@ -79,8 +96,7 @@ impl Widget for SelectableLabel {
             .visuals
             .override_text_color
             .unwrap_or_else(|| visuals.text_color());
-        ui.painter()
-            .galley(text_cursor, galley, text_style, text_color);
+        ui.painter().galley_with_color(text_pos, galley, text_color);
         response
     }
 }

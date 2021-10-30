@@ -1,22 +1,37 @@
+mod touch_state;
+
 use crate::data::input::*;
 use crate::{emath::*, util::History};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 pub use crate::data::input::Key;
+pub use touch_state::MultiTouchInfo;
+use touch_state::TouchState;
 
-/// If the pointer moves more than this, it is no longer a click (but maybe a drag)
+/// If the pointer moves more than this, it won't become a click (but it is still a drag)
 const MAX_CLICK_DIST: f32 = 6.0; // TODO: move to settings
+
+/// If the pointer is down for longer than this, it won't become a click (but it is still a drag)
+const MAX_CLICK_DURATION: f64 = 0.6; // TODO: move to settings
+
 /// The new pointer press must come within this many seconds from previous pointer release
-const MAX_CLICK_DELAY: f64 = 0.3; // TODO: move to settings
+const MAX_DOUBLE_CLICK_DELAY: f64 = 0.3; // TODO: move to settings
 
 /// Input state that egui updates each frame.
+///
+/// You can check if `egui` is using the inputs using
+/// [`crate::Context::wants_pointer_input`] and [`crate::Context::wants_keyboard_input`].
 #[derive(Clone, Debug)]
 pub struct InputState {
     /// The raw input we got this frame from the backend.
     pub raw: RawInput,
 
-    /// State of the mouse or touch.
+    /// State of the mouse or simple touch gestures which can be mapped to mouse operations.
     pub pointer: PointerState,
+
+    /// State of touches, except those covered by PointerState (like clicks and drags).
+    /// (We keep a separate `TouchState` for each encountered touch device.)
+    touch_states: BTreeMap<TouchDeviceId, TouchState>,
 
     /// How many pixels the user scrolled.
     pub scroll_delta: Vec2,
@@ -24,7 +39,7 @@ pub struct InputState {
     /// Position and size of the egui area.
     pub screen_rect: Rect,
 
-    /// Also known as device pixel ratio, > 1 for HDPI screens.
+    /// Also known as device pixel ratio, > 1 for high resolution screens.
     pub pixels_per_point: f32,
 
     /// Time in seconds. Relative to whatever. Used for animation.
@@ -33,7 +48,7 @@ pub struct InputState {
     /// Time since last frame, in seconds.
     ///
     /// This can be very unstable in reactive mode (when we don't paint each frame)
-    /// so it can be smart ot use e.g. `unstable_dt.min(1.0 / 30.0)`.
+    /// so it can be smart to use e.g. `unstable_dt.min(1.0 / 30.0)`.
     pub unstable_dt: f32,
 
     /// Used for animations to get instant feedback (avoid frame delay).
@@ -55,6 +70,7 @@ impl Default for InputState {
         Self {
             raw: Default::default(),
             pointer: Default::default(),
+            touch_states: Default::default(),
             scroll_delta: Default::default(),
             screen_rect: Rect::from_min_size(Default::default(), vec2(10_000.0, 10_000.0)),
             pixels_per_point: 1.0,
@@ -70,20 +86,16 @@ impl Default for InputState {
 
 impl InputState {
     #[must_use]
-    pub fn begin_frame(self, new: RawInput) -> InputState {
-        #![allow(deprecated)] // for screen_size
-
+    pub fn begin_frame(mut self, new: RawInput) -> InputState {
         let time = new
             .time
             .unwrap_or_else(|| self.time + new.predicted_dt as f64);
         let unstable_dt = (time - self.time) as f32;
-        let screen_rect = new.screen_rect.unwrap_or_else(|| {
-            if new.screen_size != Default::default() {
-                Rect::from_min_size(Default::default(), new.screen_size) // backwards compatability
-            } else {
-                self.screen_rect
-            }
-        });
+        let screen_rect = new.screen_rect.unwrap_or(self.screen_rect);
+        self.create_touch_states_for_new_devices(&new.events);
+        for touch_state in self.touch_states.values_mut() {
+            touch_state.begin_frame(time, &new, self.pointer.interact_pos);
+        }
         let pointer = self.pointer.begin_frame(time, &new);
         let mut keys_down = self.keys_down;
         for event in &new.events {
@@ -97,6 +109,7 @@ impl InputState {
         }
         InputState {
             pointer,
+            touch_states: self.touch_states,
             scroll_delta: new.scroll_delta,
             screen_rect,
             pixels_per_point: new.pixels_per_point.unwrap_or(self.pixels_per_point),
@@ -110,8 +123,48 @@ impl InputState {
         }
     }
 
+    #[inline(always)]
     pub fn screen_rect(&self) -> Rect {
         self.screen_rect
+    }
+
+    /// Zoom scale factor this frame (e.g. from ctrl-scroll or pinch gesture).
+    /// * `zoom = 1`: no change
+    /// * `zoom < 1`: pinch together
+    /// * `zoom > 1`: pinch spread
+    #[inline(always)]
+    pub fn zoom_delta(&self) -> f32 {
+        // If a multi touch gesture is detected, it measures the exact and linear proportions of
+        // the distances of the finger tips. It is therefore potentially more accurate than
+        // `raw.zoom_delta` which is based on the `ctrl-scroll` event which, in turn, may be
+        // synthesized from an original touch gesture.
+        self.multi_touch()
+            .map_or(self.raw.zoom_delta, |touch| touch.zoom_delta)
+    }
+
+    /// 2D non-proportional zoom scale factor this frame (e.g. from ctrl-scroll or pinch gesture).
+    ///
+    /// For multitouch devices the user can do a horizontal or vertical pinch gesture.
+    /// In these cases a non-proportional zoom factor is a available.
+    /// In other cases, this reverts to `Vec2::splat(self.zoom_delta())`.
+    ///
+    /// For horizontal pinches, this will return `[z, 1]`,
+    /// for vertical pinches this will return `[1, z]`,
+    /// and otherwise this will return `[z, z]`,
+    /// where `z` is the zoom factor:
+    /// * `zoom = 1`: no change
+    /// * `zoom < 1`: pinch together
+    /// * `zoom > 1`: pinch spread
+    #[inline(always)]
+    pub fn zoom_delta_2d(&self) -> Vec2 {
+        // If a multi touch gesture is detected, it measures the exact and linear proportions of
+        // the distances of the finger tips.  It is therefore potentially more accurate than
+        // `raw.zoom_delta` which is based on the `ctrl-scroll` event which, in turn, may be
+        // synthesized from an original touch gesture.
+        self.multi_touch().map_or_else(
+            || Vec2::splat(self.raw.zoom_delta),
+            |touch| touch.zoom_delta_2d,
+        )
     }
 
     pub fn wants_repaint(&self) -> bool {
@@ -159,21 +212,75 @@ impl InputState {
         })
     }
 
-    /// Also known as device pixel ratio, > 1 for HDPI screens.
+    /// Also known as device pixel ratio, > 1 for high resolution screens.
+    #[inline(always)]
     pub fn pixels_per_point(&self) -> f32 {
         self.pixels_per_point
     }
 
     /// Size of a physical pixel in logical gui coordinates (points).
+    #[inline(always)]
     pub fn physical_pixel_size(&self) -> f32 {
         1.0 / self.pixels_per_point()
     }
 
     /// How imprecise do we expect the mouse/touch input to be?
     /// Returns imprecision in points.
+    #[inline(always)]
     pub fn aim_radius(&self) -> f32 {
         // TODO: multiply by ~3 for touch inputs because fingers are fat
         self.physical_pixel_size()
+    }
+
+    /// Returns details about the currently ongoing multi-touch gesture, if any. Note that this
+    /// method returns `None` for single-touch gestures (click, drag, …).
+    ///
+    /// ```
+    /// # use egui::emath::Rot2;
+    /// # let ui = &mut egui::Ui::__test();
+    /// let mut zoom = 1.0; // no zoom
+    /// let mut rotation = 0.0; // no rotation
+    /// if let Some(multi_touch) = ui.input().multi_touch() {
+    ///     zoom *= multi_touch.zoom_delta;
+    ///     rotation += multi_touch.rotation_delta;
+    /// }
+    /// let transform = zoom * Rot2::from_angle(rotation);
+    /// ```
+    ///
+    /// By far not all touch devices are supported, and the details depend on the `egui`
+    /// integration backend you are using. `egui_web` supports multi touch for most mobile
+    /// devices, but not for a `Trackpad` on `MacOS`, for example. The backend has to be able to
+    /// capture native touch events, but many browsers seem to pass such events only for touch
+    /// _screens_, but not touch _pads._
+    ///
+    /// Refer to [`MultiTouchInfo`] for details about the touch information available.
+    ///
+    /// Consider using `zoom_delta()` instead of `MultiTouchInfo::zoom_delta` as the former
+    /// delivers a synthetic zoom factor based on ctrl-scroll events, as a fallback.
+    pub fn multi_touch(&self) -> Option<MultiTouchInfo> {
+        // In case of multiple touch devices simply pick the touch_state of the first active device
+        if let Some(touch_state) = self.touch_states.values().find(|t| t.is_active()) {
+            touch_state.info()
+        } else {
+            None
+        }
+    }
+
+    /// True if there currently are any fingers touching egui.
+    pub fn any_touches(&self) -> bool {
+        !self.touch_states.is_empty()
+    }
+
+    /// Scans `events` for device IDs of touch devices we have not seen before,
+    /// and creates a new `TouchState` for each such device.
+    fn create_touch_states_for_new_devices(&mut self, events: &[Event]) {
+        for event in events {
+            if let Event::Touch { device_id, .. } = event {
+                self.touch_states
+                    .entry(*device_id)
+                    .or_insert_with(|| TouchState::new(*device_id));
+            }
+        }
     }
 }
 
@@ -218,6 +325,9 @@ impl PointerEvent {
 /// Mouse or touch state.
 #[derive(Clone, Debug)]
 pub struct PointerState {
+    /// Latest known time
+    time: f64,
+
     // Consider a finger tapping a touch screen.
     // What position should we report?
     // The location of the touch, or `None`, because the finger is gone?
@@ -249,16 +359,18 @@ pub struct PointerState {
     /// `None` if no mouse button is down.
     press_origin: Option<Pos2>,
 
-    /// If the pointer button is down, will it register as a click when released?
-    /// Set to true on pointer button down, set to false when pointer button moves too much.
-    could_be_click: bool,
+    /// When did the current click/drag originate?
+    /// `None` if no mouse button is down.
+    press_start_time: Option<f64>,
+
+    /// Set to `true` if the pointer has moved too much (since being pressed)
+    /// for it to be registered as a click.
+    pub(crate) has_moved_too_much_for_a_click: bool,
 
     /// When did the pointer get click last?
     /// Used to check for double-clicks.
     last_click_time: f64,
 
-    // /// All clicks that occurred this frame
-    // clicks: Vec<Click>,
     /// All button events that occurred this frame
     pub(crate) pointer_events: Vec<PointerEvent>,
 }
@@ -266,14 +378,16 @@ pub struct PointerState {
 impl Default for PointerState {
     fn default() -> Self {
         Self {
+            time: -f64::INFINITY,
             latest_pos: None,
             interact_pos: None,
             delta: Vec2::ZERO,
             velocity: Vec2::ZERO,
-            pos_history: History::new(1000, 0.1),
+            pos_history: History::new(0..1000, 0.1),
             down: Default::default(),
             press_origin: None,
-            could_be_click: false,
+            press_start_time: None,
+            has_moved_too_much_for_a_click: false,
             last_click_time: std::f64::NEG_INFINITY,
             pointer_events: vec![],
         }
@@ -283,6 +397,8 @@ impl Default for PointerState {
 impl PointerState {
     #[must_use]
     pub(crate) fn begin_frame(mut self, time: f64, new: &RawInput) -> PointerState {
+        self.time = time;
+
         self.pointer_events.clear();
 
         let old_pos = self.latest_pos;
@@ -296,10 +412,9 @@ impl PointerState {
                     self.latest_pos = Some(pos);
                     self.interact_pos = Some(pos);
 
-                    if let Some(press_origin) = &mut self.press_origin {
-                        self.could_be_click &= press_origin.distance(pos) < MAX_CLICK_DIST;
-                    } else {
-                        self.could_be_click = false;
+                    if let Some(press_origin) = self.press_origin {
+                        self.has_moved_too_much_for_a_click |=
+                            press_origin.distance(pos) > MAX_CLICK_DIST;
                     }
 
                     self.pointer_events.push(PointerEvent::Moved(pos));
@@ -326,13 +441,15 @@ impl PointerState {
 
                     if pressed {
                         self.press_origin = Some(pos);
-                        self.could_be_click = true;
+                        self.press_start_time = Some(time);
+                        self.has_moved_too_much_for_a_click = false;
                         self.pointer_events.push(PointerEvent::Pressed(pos));
                     } else {
-                        let clicked = self.could_be_click;
+                        let clicked = self.could_any_button_be_click();
 
                         let click = if clicked {
-                            let double_click = (time - self.last_click_time) < MAX_CLICK_DELAY;
+                            let double_click =
+                                (time - self.last_click_time) < MAX_DOUBLE_CLICK_DELAY;
                             let count = if double_click { 2 } else { 1 };
 
                             self.last_click_time = time;
@@ -350,10 +467,10 @@ impl PointerState {
                         self.pointer_events.push(PointerEvent::Released(click));
 
                         self.press_origin = None;
-                        self.could_be_click = false;
+                        self.press_start_time = None;
                     }
 
-                    self.down[button as usize] = pressed;
+                    self.down[button as usize] = pressed; // must be done after the above call to `could_any_button_be_click`
                 }
                 Event::PointerGone => {
                     self.latest_pos = None;
@@ -393,28 +510,40 @@ impl PointerState {
     }
 
     /// How much the pointer moved compared to last frame, in points.
+    #[inline(always)]
     pub fn delta(&self) -> Vec2 {
         self.delta
     }
 
     /// Current velocity of pointer.
+    #[inline(always)]
     pub fn velocity(&self) -> Vec2 {
         self.velocity
     }
 
     /// Where did the current click/drag originate?
     /// `None` if no mouse button is down.
+    #[inline(always)]
     pub fn press_origin(&self) -> Option<Pos2> {
         self.press_origin
     }
 
+    /// When did the current click/drag originate?
+    /// `None` if no mouse button is down.
+    #[inline(always)]
+    pub fn press_start_time(&self) -> Option<f64> {
+        self.press_start_time
+    }
+
     /// Latest reported pointer position.
     /// When tapping a touch screen, this will be `None`.
+    #[inline(always)]
     pub(crate) fn latest_pos(&self) -> Option<Pos2> {
         self.latest_pos
     }
 
     /// If it is a good idea to show a tooltip, where is pointer?
+    #[inline(always)]
     pub fn hover_pos(&self) -> Option<Pos2> {
         self.latest_pos
     }
@@ -424,6 +553,7 @@ impl PointerState {
     /// Latest position of the mouse, but ignoring any [`Event::PointerGone`]
     /// if there were interactions this frame.
     /// When tapping a touch screen, this will be the location of the touch.
+    #[inline(always)]
     pub fn interact_pos(&self) -> Option<Pos2> {
         self.interact_pos
     }
@@ -431,18 +561,21 @@ impl PointerState {
     /// Do we have a pointer?
     ///
     /// `false` if the mouse is not over the egui area, or if no touches are down on touch screens.
+    #[inline(always)]
     pub fn has_pointer(&self) -> bool {
         self.latest_pos.is_some()
     }
 
     /// Is the pointer currently still?
     /// This is smoothed so a few frames of stillness is required before this returns `true`.
+    #[inline(always)]
     pub fn is_still(&self) -> bool {
         self.velocity == Vec2::ZERO
     }
 
     /// Is the pointer currently moving?
     /// This is smoothed so a few frames of stillness is required before this returns `false`.
+    #[inline]
     pub fn is_moving(&self) -> bool {
         self.velocity != Vec2::ZERO
     }
@@ -482,12 +615,47 @@ impl PointerState {
     // }
 
     /// Is this button currently down?
+    #[inline(always)]
     pub fn button_down(&self, button: PointerButton) -> bool {
         self.down[button as usize]
     }
 
+    /// If the pointer button is down, will it register as a click when released?
+    #[inline(always)]
     pub(crate) fn could_any_button_be_click(&self) -> bool {
-        self.could_be_click
+        if !self.any_down() {
+            return false;
+        }
+
+        if self.has_moved_too_much_for_a_click {
+            return false;
+        }
+
+        if let Some(press_start_time) = self.press_start_time {
+            if self.time - press_start_time > MAX_CLICK_DURATION {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    /// Is the primary button currently down?
+    #[inline(always)]
+    pub fn primary_down(&self) -> bool {
+        self.button_down(PointerButton::Primary)
+    }
+
+    /// Is the secondary button currently down?
+    #[inline(always)]
+    pub fn secondary_down(&self) -> bool {
+        self.button_down(PointerButton::Secondary)
+    }
+
+    /// Is the middle button currently down?
+    #[inline(always)]
+    pub fn middle_down(&self) -> bool {
+        self.button_down(PointerButton::Middle)
     }
 }
 
@@ -496,6 +664,7 @@ impl InputState {
         let Self {
             raw,
             pointer,
+            touch_states,
             scroll_delta,
             screen_rect,
             pixels_per_point,
@@ -515,6 +684,12 @@ impl InputState {
             .show(ui, |ui| {
                 pointer.ui(ui);
             });
+
+        for (device_id, touch_state) in touch_states {
+            ui.collapsing(format!("Touch State [device {}]", device_id.0), |ui| {
+                touch_state.ui(ui);
+            });
+        }
 
         ui.label(format!("scroll_delta: {:?} points", scroll_delta));
         ui.label(format!("screen_rect: {:?} points", screen_rect));
@@ -538,6 +713,7 @@ impl InputState {
 impl PointerState {
     pub fn ui(&self, ui: &mut crate::Ui) {
         let Self {
+            time: _,
             latest_pos,
             interact_pos,
             delta,
@@ -545,7 +721,8 @@ impl PointerState {
             pos_history: _,
             down,
             press_origin,
-            could_be_click,
+            press_start_time,
+            has_moved_too_much_for_a_click,
             last_click_time,
             pointer_events,
         } = self;
@@ -559,7 +736,11 @@ impl PointerState {
         ));
         ui.label(format!("down: {:#?}", down));
         ui.label(format!("press_origin: {:?}", press_origin));
-        ui.label(format!("could_be_click: {:#?}", could_be_click));
+        ui.label(format!("press_start_time: {:?} s", press_start_time));
+        ui.label(format!(
+            "has_moved_too_much_for_a_click: {}",
+            has_moved_too_much_for_a_click
+        ));
         ui.label(format!("last_click_time: {:#?}", last_click_time));
         ui.label(format!("pointer_events: {:?}", pointer_events));
     }

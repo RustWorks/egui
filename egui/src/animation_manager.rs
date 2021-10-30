@@ -1,10 +1,8 @@
-use std::collections::HashMap;
-
-use crate::{emath::remap_clamp, Id, InputState};
+use crate::{emath::remap_clamp, Id, IdMap, InputState};
 
 #[derive(Clone, Default)]
 pub(crate) struct AnimationManager {
-    bools: HashMap<Id, BoolAnim>,
+    bools: IdMap<BoolAnim>,
 }
 
 #[derive(Clone, Debug)]

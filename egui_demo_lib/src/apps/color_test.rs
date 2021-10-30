@@ -9,9 +9,9 @@ const RED: Color32 = Color32::RED;
 const TRANSPARENT: Color32 = Color32::TRANSPARENT;
 const WHITE: Color32 = Color32::WHITE;
 
-#[cfg_attr(feature = "persistence", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct ColorTest {
-    #[cfg_attr(feature = "persistence", serde(skip))]
+    #[cfg_attr(feature = "serde", serde(skip))]
     tex_mngr: TextureManager,
     vertex_gradients: bool,
     texture_gradients: bool,
@@ -37,14 +37,12 @@ impl epi::App for ColorTest {
     fn update(&mut self, ctx: &egui::CtxRef, frame: &mut epi::Frame<'_>) {
         egui::CentralPanel::default().show(ctx, |ui| {
             if frame.is_web() {
-                ui.colored_label(
-                    RED,
-                    "NOTE: The WebGL backend does NOT pass the color test."
+                ui.label(
+                    "NOTE: The WebGL1 backend without sRGB support does NOT pass the color test.",
                 );
-                ui.small("This is because WebGL does not support a linear framebuffer blending (not even WebGL2!).\nMaybe when WebGL3 becomes mainstream in 2030 the web can finally get colors right?");
                 ui.separator();
             }
-            ScrollArea::auto_sized().show(ui, |ui| {
+            ScrollArea::both().auto_shrink([false; 2]).show(ui, |ui| {
                 self.ui(ui, &mut Some(frame.tex_allocator()));
             });
         });
@@ -57,6 +55,8 @@ impl ColorTest {
         ui: &mut Ui,
         mut tex_allocator: &mut Option<&mut dyn epi::TextureAllocator>,
     ) {
+        ui.set_max_width(680.0);
+
         ui.vertical_centered(|ui| {
             ui.add(crate::__egui_github_link_file!());
         });
@@ -70,7 +70,7 @@ impl ColorTest {
 
         ui.heading("sRGB color test");
         ui.label("Use a color picker to ensure this color is (255, 165, 0) / #ffa500");
-        ui.wrap(|ui| {
+        ui.scope(|ui| {
             ui.spacing_mut().item_spacing.y = 0.0; // No spacing between gradients
             let g = Gradient::one_color(Color32::from_rgb(255, 165, 0));
             self.vertex_gradient(ui, "orange rgb(255, 165, 0) - vertex", WHITE, &g);
@@ -86,7 +86,7 @@ impl ColorTest {
         ui.separator();
 
         ui.label("Test that vertex color times texture color is done in linear space:");
-        ui.wrap(|ui| {
+        ui.scope(|ui| {
             ui.spacing_mut().item_spacing.y = 0.0; // No spacing between gradients
 
             let tex_color = Rgba::from_rgb(1.0, 0.25, 0.25);
@@ -185,7 +185,7 @@ impl ColorTest {
             show_color(ui, right, color_size);
         });
 
-        ui.wrap(|ui| {
+        ui.scope(|ui| {
             ui.spacing_mut().item_spacing.y = 0.0; // No spacing between gradients
             if is_opaque {
                 let g = Gradient::ground_truth_linear_gradient(left, right);

@@ -6,9 +6,10 @@ use std::{fmt::Debug, hash::Hash};
 
 use crate::*;
 
-/// State that is persisted between frames
+/// State that is persisted between frames.
+// TODO: this is not currently stored in `memory().data`, but maybe it should be?
 #[derive(Clone, Copy, Debug)]
-#[cfg_attr(feature = "persistence", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub(crate) struct State {
     /// Last known pos
     pub pos: Pos2,
@@ -40,6 +41,7 @@ impl State {
 ///     .show(ctx, |ui| {
 ///         ui.label("Floating text!");
 ///     });
+#[must_use = "You should call .show()"]
 #[derive(Clone, Copy, Debug)]
 pub struct Area {
     pub(crate) id: Id,
@@ -48,6 +50,7 @@ pub struct Area {
     enabled: bool,
     order: Order,
     default_pos: Option<Pos2>,
+    anchor: Option<(Align2, Vec2)>,
     new_pos: Option<Pos2>,
     drag_bounds: Option<Rect>,
 }
@@ -62,6 +65,7 @@ impl Area {
             order: Order::Middle,
             default_pos: None,
             new_pos: None,
+            anchor: None,
             drag_bounds: None,
         }
     }
@@ -120,17 +124,31 @@ impl Area {
 
     /// Positions the window and prevents it from being moved
     pub fn fixed_pos(mut self, fixed_pos: impl Into<Pos2>) -> Self {
-        let fixed_pos = fixed_pos.into();
-        self.new_pos = Some(fixed_pos);
+        self.new_pos = Some(fixed_pos.into());
         self.movable = false;
         self
     }
 
     /// Positions the window but you can still move it.
     pub fn current_pos(mut self, current_pos: impl Into<Pos2>) -> Self {
-        let current_pos = current_pos.into();
-        self.new_pos = Some(current_pos);
+        self.new_pos = Some(current_pos.into());
         self
+    }
+
+    /// Set anchor and distance.
+    ///
+    /// An anchor of `Align2::RIGHT_TOP` means "put the right-top corner of the window
+    /// in the right-top corner of the screen".
+    ///
+    /// The offset is added to the position, so e.g. an offset of `[-5.0, 5.0]`
+    /// would move the window left and down from the given anchor.
+    ///
+    /// Anchoring also makes the window immovable.
+    ///
+    /// It is an error to set both an anchor and a position.
+    pub fn anchor(mut self, align: Align2, offset: impl Into<Vec2>) -> Self {
+        self.anchor = Some((align, offset.into()));
+        self.movable(false)
     }
 
     /// Constrain the area up to which the window can be dragged.
@@ -138,17 +156,37 @@ impl Area {
         self.drag_bounds = Some(bounds);
         self
     }
+
+    pub(crate) fn get_pivot(&self) -> Align2 {
+        if let Some((pivot, _)) = self.anchor {
+            pivot
+        } else {
+            Align2::LEFT_TOP
+        }
+    }
 }
 
 pub(crate) struct Prepared {
     layer_id: LayerId,
     state: State,
-    movable: bool,
+    pub(crate) movable: bool,
     enabled: bool,
     drag_bounds: Option<Rect>,
 }
 
 impl Area {
+    pub fn show<R>(
+        self,
+        ctx: &CtxRef,
+        add_contents: impl FnOnce(&mut Ui) -> R,
+    ) -> InnerResponse<R> {
+        let prepared = self.begin(ctx);
+        let mut content_ui = prepared.content_ui(ctx);
+        let inner = add_contents(&mut content_ui);
+        let response = prepared.end(ctx, content_ui);
+        InnerResponse { inner, response }
+    }
+
     pub(crate) fn begin(self, ctx: &CtxRef) -> Prepared {
         let Area {
             id,
@@ -158,18 +196,31 @@ impl Area {
             enabled,
             default_pos,
             new_pos,
+            anchor,
             drag_bounds,
         } = self;
 
         let layer_id = LayerId::new(order, id);
 
         let state = ctx.memory().areas.get(id).cloned();
+        let is_new = state.is_none();
         let mut state = state.unwrap_or_else(|| State {
             pos: default_pos.unwrap_or_else(|| automatic_area_position(ctx)),
             size: Vec2::ZERO,
             interactable,
         });
         state.pos = new_pos.unwrap_or(state.pos);
+
+        if let Some((anchor, offset)) = anchor {
+            if is_new {
+                // unknown size
+                ctx.request_repaint();
+            } else {
+                let screen = ctx.available_rect();
+                state.pos = anchor.align_size_within_rect(state.size, screen).min + offset;
+            }
+        }
+
         state.pos = ctx.round_pos_to_pixels(state.pos);
 
         Prepared {
@@ -179,13 +230,6 @@ impl Area {
             enabled,
             drag_bounds,
         }
-    }
-
-    pub fn show(self, ctx: &CtxRef, add_contents: impl FnOnce(&mut Ui)) -> Response {
-        let prepared = self.begin(ctx);
-        let mut content_ui = prepared.content_ui(ctx);
-        add_contents(&mut content_ui);
-        prepared.end(ctx, content_ui)
     }
 
     pub fn show_open_close_animation(&self, ctx: &CtxRef, frame: &Frame, is_open: bool) {
@@ -231,23 +275,32 @@ impl Prepared {
     }
 
     pub(crate) fn content_ui(&self, ctx: &CtxRef) -> Ui {
-        let max_rect = Rect::from_min_size(self.state.pos, Vec2::INFINITY);
+        let screen_rect = ctx.input().screen_rect();
+
+        let bounds = if let Some(bounds) = self.drag_bounds {
+            bounds.intersect(screen_rect) // protect against infinite bounds
+        } else {
+            let central_area = ctx.available_rect();
+
+            let is_within_central_area = central_area.contains_rect(self.state.rect().shrink(1.0));
+            if is_within_central_area {
+                central_area // let's try to not cover side panels
+            } else {
+                screen_rect
+            }
+        };
+
+        let max_rect = Rect::from_min_max(
+            self.state.pos,
+            bounds.max.at_least(self.state.pos + Vec2::splat(32.0)),
+        );
+
         let shadow_radius = ctx.style().visuals.window_shadow.extrusion; // hacky
-        let bounds = self.drag_bounds.unwrap_or_else(|| ctx.input().screen_rect);
+        let clip_rect_margin = ctx.style().visuals.clip_rect_margin.max(shadow_radius);
 
-        let mut clip_rect = max_rect
-            .expand(ctx.style().visuals.clip_rect_margin)
-            .expand(shadow_radius)
+        let clip_rect = Rect::from_min_max(self.state.pos, bounds.max)
+            .expand(clip_rect_margin)
             .intersect(bounds);
-
-        // Windows are constrained to central area,
-        // (except in rare cases where they don't fit).
-        // Adjust clip rect so we don't cast shadows on side panels:
-        let central_area = ctx.available_rect();
-        let is_within_central_area = central_area.contains(self.state.pos);
-        if is_within_central_area {
-            clip_rect = clip_rect.intersect(central_area);
-        }
 
         let mut ui = Ui::new(
             ctx.clone(),
@@ -294,10 +347,11 @@ impl Prepared {
             state.pos += ctx.input().pointer.delta();
         }
 
-        if let Some(bounds) = drag_bounds {
-            state.pos = ctx.constrain_window_rect_to_area(state.rect(), bounds).min;
-        } else {
-            state.pos = ctx.constrain_window_rect(state.rect()).min;
+        // Important check - don't try to move e.g. a combobox popup!
+        if movable {
+            state.pos = ctx
+                .constrain_window_rect_to_area(state.rect(), drag_bounds)
+                .min;
         }
 
         if (move_response.dragged() || move_response.clicked())

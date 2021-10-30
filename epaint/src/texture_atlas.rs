@@ -12,11 +12,24 @@ pub struct Texture {
 }
 
 impl Texture {
+    pub fn size(&self) -> [usize; 2] {
+        [self.width, self.height]
+    }
+
     /// Returns the textures as `sRGBA` premultiplied pixels, row by row, top to bottom.
-    pub fn srgba_pixels(&'_ self) -> impl Iterator<Item = super::Color32> + '_ {
+    ///
+    /// `gamma` should normally be set to 1.0.
+    /// If you are having problems with egui text looking skinny and pixelated, try
+    /// setting a lower gamma, e.g. `0.5`.
+    pub fn srgba_pixels(&'_ self, gamma: f32) -> impl Iterator<Item = super::Color32> + '_ {
         use super::Color32;
-        let srgba_from_luminance_lut: Vec<Color32> =
-            (0..=255).map(Color32::from_white_alpha).collect();
+
+        let srgba_from_luminance_lut: Vec<Color32> = (0..=255)
+            .map(|a| {
+                let a = super::color::linear_f32_from_linear_u8(a).powf(gamma);
+                super::Rgba::from_white_alpha(a).into()
+            })
+            .collect();
         self.pixels
             .iter()
             .map(move |&l| srgba_from_luminance_lut[l as usize])
@@ -26,6 +39,7 @@ impl Texture {
 impl std::ops::Index<(usize, usize)> for Texture {
     type Output = u8;
 
+    #[inline]
     fn index(&self, (x, y): (usize, usize)) -> &u8 {
         assert!(x < self.width);
         assert!(y < self.height);
@@ -34,6 +48,7 @@ impl std::ops::Index<(usize, usize)> for Texture {
 }
 
 impl std::ops::IndexMut<(usize, usize)> for Texture {
+    #[inline]
     fn index_mut(&mut self, (x, y): (usize, usize)) -> &mut u8 {
         assert!(x < self.width);
         assert!(y < self.height);
@@ -82,7 +97,12 @@ impl TextureAtlas {
         /// On modern high-precision GPUs this is not needed.
         const PADDING: usize = 1;
 
-        assert!(w <= self.texture.width);
+        assert!(
+            w <= self.texture.width,
+            "Tried to allocate a {} wide glyph in a {} wide texture atlas",
+            w,
+            self.texture.width
+        );
         if self.cursor.0 + w > self.texture.width {
             // New row:
             self.cursor.0 = 0;

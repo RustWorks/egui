@@ -9,48 +9,86 @@
 //! * (0,0) is left top.
 //! * Dimension order is always `x y`
 
-#![cfg_attr(not(debug_assertions), deny(warnings))] // Forbid warnings in release builds
+// Forbid warnings in release builds:
+#![cfg_attr(not(debug_assertions), deny(warnings))]
 #![forbid(unsafe_code)]
 #![warn(
     clippy::all,
     clippy::await_holding_lock,
+    clippy::char_lit_as_u8,
+    clippy::checked_conversions,
     clippy::dbg_macro,
+    clippy::debug_assert_with_mut_call,
+    clippy::disallowed_method,
     clippy::doc_markdown,
     clippy::empty_enum,
     clippy::enum_glob_use,
     clippy::exit,
+    clippy::expl_impl_clone_on_copy,
+    clippy::explicit_deref_methods,
+    clippy::explicit_into_iter_loop,
+    clippy::fallible_impl_from,
     clippy::filter_map_next,
+    clippy::flat_map_option,
+    clippy::float_cmp_const,
     clippy::fn_params_excessive_bools,
+    clippy::from_iter_instead_of_collect,
     clippy::if_let_mutex,
+    clippy::implicit_clone,
     clippy::imprecise_flops,
     clippy::inefficient_to_string,
+    clippy::invalid_upcast_comparisons,
+    clippy::large_digit_groups,
+    clippy::large_stack_arrays,
+    clippy::large_types_passed_by_value,
+    clippy::let_unit_value,
     clippy::linkedlist,
     clippy::lossy_float_literal,
     clippy::macro_use_imports,
+    clippy::manual_ok_or,
+    clippy::map_err_ignore,
+    clippy::map_flatten,
+    clippy::map_unwrap_or,
     clippy::match_on_vec_items,
+    clippy::match_same_arms,
+    clippy::match_wild_err_arm,
     clippy::match_wildcard_for_single_variants,
     clippy::mem_forget,
     clippy::mismatched_target_os,
     clippy::missing_errors_doc,
     clippy::missing_safety_doc,
+    clippy::mut_mut,
+    clippy::mutex_integer,
     clippy::needless_borrow,
     clippy::needless_continue,
+    clippy::needless_for_each,
     clippy::needless_pass_by_value,
     clippy::option_option,
-    clippy::pub_enum_variant_names,
+    clippy::path_buf_push_overwrite,
+    clippy::ptr_as_ptr,
+    clippy::ref_option_ref,
     clippy::rest_pat_in_fully_bound_structs,
+    clippy::same_functions_in_if_condition,
+    clippy::semicolon_if_nothing_returned,
+    clippy::single_match_else,
+    clippy::string_add_assign,
+    clippy::string_add,
+    clippy::string_lit_as_bytes,
+    clippy::string_to_string,
     clippy::todo,
+    clippy::trait_duplication_in_bounds,
     clippy::unimplemented,
     clippy::unnested_or_patterns,
+    clippy::unused_self,
+    clippy::useless_transmute,
     clippy::verbose_file_reads,
+    clippy::zero_sized_map_values,
     future_incompatible,
     missing_crate_level_docs,
-    missing_doc_code_examples,
-    // missing_docs,
     nonstandard_style,
-    rust_2018_idioms,
-    unused_doc_comments,
+    rust_2018_idioms
 )]
+#![allow(clippy::float_cmp)]
 #![allow(clippy::manual_range_contains)]
 
 use std::ops::{Add, Div, Mul, RangeInclusive, Sub};
@@ -58,6 +96,7 @@ use std::ops::{Add, Div, Mul, RangeInclusive, Sub};
 // ----------------------------------------------------------------------------
 
 pub mod align;
+mod numeric;
 mod pos2;
 mod rect;
 mod rect_transform;
@@ -67,6 +106,7 @@ mod vec2;
 
 pub use {
     align::{Align, Align2},
+    numeric::*,
     pos2::*,
     rect::*,
     rect_transform::*,
@@ -81,11 +121,13 @@ pub trait One {
     fn one() -> Self;
 }
 impl One for f32 {
+    #[inline(always)]
     fn one() -> Self {
         1.0
     }
 }
 impl One for f64 {
+    #[inline(always)]
     fn one() -> Self {
         1.0
     }
@@ -110,6 +152,7 @@ impl Real for f64 {}
 // ----------------------------------------------------------------------------
 
 /// Linear interpolation.
+#[inline(always)]
 pub fn lerp<R, T>(range: RangeInclusive<R>, t: T) -> R
 where
     T: Real + Mul<R, Output = R>,
@@ -125,8 +168,7 @@ pub fn remap<T>(x: T, from: RangeInclusive<T>, to: RangeInclusive<T>) -> T
 where
     T: Real,
 {
-    #![allow(clippy::float_cmp)]
-    debug_assert!(from.start() != from.end());
+    crate::emath_assert!(from.start() != from.end());
     let t = (x - *from.start()) / (*from.end() - *from.start());
     lerp(to, t)
 }
@@ -136,7 +178,6 @@ pub fn remap_clamp<T>(x: T, from: RangeInclusive<T>, to: RangeInclusive<T>) -> T
 where
     T: Real,
 {
-    #![allow(clippy::float_cmp)]
     if from.end() < from.start() {
         return remap_clamp(x, *from.end()..=*from.start(), *to.end()..=*to.start());
     }
@@ -145,7 +186,7 @@ where
     } else if *from.end() <= x {
         *to.end()
     } else {
-        debug_assert!(from.start() != from.end());
+        crate::emath_assert!(from.start() != from.end());
         let t = (x - *from.start()) / (*from.end() - *from.start());
         // Ensure no numerical inaccuracies sneak in:
         if T::one() <= t {
@@ -153,23 +194,6 @@ where
         } else {
             lerp(to, t)
         }
-    }
-}
-
-/// Returns `range.start()` if `x <= range.start()`,
-/// returns `range.end()` if `x >= range.end()`
-/// and returns `x` elsewhen.
-pub fn clamp<T>(x: T, range: RangeInclusive<T>) -> T
-where
-    T: Copy + PartialOrd,
-{
-    debug_assert!(range.start() <= range.end());
-    if x <= *range.start() {
-        *range.start()
-    } else if *range.end() <= x {
-        *range.end()
-    } else {
-        x
     }
 }
 
@@ -188,14 +212,12 @@ pub fn format_with_minimum_decimals(value: f64, decimals: usize) -> String {
 pub fn format_with_decimals_in_range(value: f64, decimal_range: RangeInclusive<usize>) -> String {
     let min_decimals = *decimal_range.start();
     let max_decimals = *decimal_range.end();
-    debug_assert!(min_decimals <= max_decimals);
-    debug_assert!(max_decimals < 100);
+    crate::emath_assert!(min_decimals <= max_decimals);
+    crate::emath_assert!(max_decimals < 100);
     let max_decimals = max_decimals.min(16);
     let min_decimals = min_decimals.min(max_decimals);
 
-    if min_decimals == max_decimals {
-        format!("{:.*}", max_decimals, value)
-    } else {
+    if min_decimals != max_decimals {
         // Ugly/slow way of doing this. TODO: clean up precision.
         for decimals in min_decimals..max_decimals {
             let text = format!("{:.*}", decimals, value);
@@ -208,8 +230,8 @@ pub fn format_with_decimals_in_range(value: f64, decimal_range: RangeInclusive<u
         // The value has more precision than we expected.
         // Probably the value was set not by the slider, but from outside.
         // In any case: show the full value
-        format!("{:.*}", max_decimals, value)
     }
+    format!("{:.*}", max_decimals, value)
 }
 
 /// Return true when arguments are the same within some rounding error.
@@ -218,8 +240,6 @@ pub fn format_with_decimals_in_range(value: f64, decimal_range: RangeInclusive<u
 /// The `epsilon`  can be `f32::EPSILON` to handle simple transforms (like degrees -> radians)
 /// but should be higher to handle more complex transformations.
 pub fn almost_equal(a: f32, b: f32, epsilon: f32) -> bool {
-    #![allow(clippy::float_cmp)]
-
     if a == b {
         true // handle infinites
     } else {
@@ -275,7 +295,6 @@ fn test_almost_equal() {
     }
 }
 
-#[allow(clippy::float_cmp)]
 #[test]
 fn test_remap() {
     assert_eq!(remap_clamp(1.0, 0.0..=1.0, 0.0..=16.0), 16.0);
@@ -297,9 +316,11 @@ pub trait NumExt {
 macro_rules! impl_num_ext {
     ($t: ty) => {
         impl NumExt for $t {
+            #[inline(always)]
             fn at_least(self, lower_limit: Self) -> Self {
                 self.max(lower_limit)
             }
+            #[inline(always)]
             fn at_most(self, upper_limit: Self) -> Self {
                 self.min(upper_limit)
             }
@@ -312,3 +333,52 @@ impl_num_ext!(f64);
 impl_num_ext!(usize);
 impl_num_ext!(Vec2);
 impl_num_ext!(Pos2);
+
+// ----------------------------------------------------------------------------
+
+/// Wrap angle to `[-PI, PI]` range.
+pub fn normalized_angle(mut angle: f32) -> f32 {
+    use std::f32::consts::{PI, TAU};
+    angle %= TAU;
+    if angle > PI {
+        angle -= TAU;
+    } else if angle < -PI {
+        angle += TAU;
+    }
+    angle
+}
+
+#[test]
+fn test_normalized_angle() {
+    macro_rules! almost_eq {
+        ($left: expr, $right: expr) => {
+            let left = $left;
+            let right = $right;
+            assert!((left - right).abs() < 1e-6, "{} != {}", left, right);
+        };
+    }
+
+    use std::f32::consts::TAU;
+    almost_eq!(normalized_angle(-3.0 * TAU), 0.0);
+    almost_eq!(normalized_angle(-2.3 * TAU), -0.3 * TAU);
+    almost_eq!(normalized_angle(-TAU), 0.0);
+    almost_eq!(normalized_angle(0.0), 0.0);
+    almost_eq!(normalized_angle(TAU), 0.0);
+    almost_eq!(normalized_angle(2.7 * TAU), -0.3 * TAU);
+}
+
+// ----------------------------------------------------------------------------
+
+/// An assert that is only active when `emath` is compiled with the `extra_asserts` feature
+/// or with the `extra_debug_asserts` feature in debug builds.
+#[macro_export]
+macro_rules! emath_assert {
+    ($($arg: tt)*) => {
+        if cfg!(any(
+            feature = "extra_asserts",
+            all(feature = "extra_debug_asserts", debug_assertions),
+        )) {
+            assert!($($arg)*);
+        }
+    }
+}

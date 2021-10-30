@@ -1,5 +1,4 @@
 #![allow(clippy::needless_pass_by_value)] // False positives with `impl ToString`
-#![allow(clippy::float_cmp)]
 
 use crate::{widgets::Label, *};
 use std::ops::RangeInclusive;
@@ -47,8 +46,10 @@ struct SliderSpec {
 /// ```
 /// # let ui = &mut egui::Ui::__test();
 /// # let mut my_f32: f32 = 0.0;
-/// ui.add(egui::Slider::f32(&mut my_f32, 0.0..=100.0).text("My value"));
+/// ui.add(egui::Slider::new(&mut my_f32, 0.0..=100.0).text("My value"));
 /// ```
+///
+/// The default `Slider` size is set by [`crate::style::Spacing::slider_width`].
 #[must_use = "You should put this widget in an ui with `ui.add(widget);`"]
 pub struct Slider<'a> {
     get_set_value: GetSetValue<'a>,
@@ -65,51 +66,22 @@ pub struct Slider<'a> {
     max_decimals: Option<usize>,
 }
 
-macro_rules! impl_integer_constructor {
-    ($int:ident) => {
-        pub fn $int(value: &'a mut $int, range: RangeInclusive<$int>) -> Self {
-            let range_f64 = (*range.start() as f64)..=(*range.end() as f64);
-            Self::from_get_set(range_f64, move |v: Option<f64>| {
-                if let Some(v) = v {
-                    *value = v.round() as $int
-                }
-                *value as f64
-            })
-            .integer()
-        }
-    };
-}
-
 impl<'a> Slider<'a> {
-    pub fn f32(value: &'a mut f32, range: RangeInclusive<f32>) -> Self {
-        let range_f64 = (*range.start() as f64)..=(*range.end() as f64);
-        Self::from_get_set(range_f64, move |v: Option<f64>| {
+    pub fn new<Num: emath::Numeric>(value: &'a mut Num, range: RangeInclusive<Num>) -> Self {
+        let range_f64 = range.start().to_f64()..=range.end().to_f64();
+        let slf = Self::from_get_set(range_f64, move |v: Option<f64>| {
             if let Some(v) = v {
-                *value = v as f32
+                *value = Num::from_f64(v);
             }
-            *value as f64
-        })
-    }
+            value.to_f64()
+        });
 
-    pub fn f64(value: &'a mut f64, range: RangeInclusive<f64>) -> Self {
-        Self::from_get_set(range, move |v: Option<f64>| {
-            if let Some(v) = v {
-                *value = v
-            }
-            *value
-        })
+        if Num::INTEGRAL {
+            slf.integer()
+        } else {
+            slf
+        }
     }
-
-    impl_integer_constructor!(i8);
-    impl_integer_constructor!(u8);
-    impl_integer_constructor!(i16);
-    impl_integer_constructor!(u16);
-    impl_integer_constructor!(i32);
-    impl_integer_constructor!(u32);
-    impl_integer_constructor!(i64);
-    impl_integer_constructor!(u64);
-    impl_integer_constructor!(isize);
-    impl_integer_constructor!(usize);
 
     pub fn from_get_set(
         range: RangeInclusive<f64>,
@@ -123,7 +95,7 @@ impl<'a> Slider<'a> {
                 smallest_positive: 1e-6,
                 largest_finite: f64::INFINITY,
             },
-            clamp_to_range: false,
+            clamp_to_range: true,
             smart_aim: true,
             show_value: true,
             prefix: Default::default(),
@@ -155,8 +127,8 @@ impl<'a> Slider<'a> {
     }
 
     /// Show a text next to the slider (e.g. explaining what the slider controls).
-    pub fn text(mut self, text: impl Into<String>) -> Self {
-        self.text = text.into();
+    pub fn text(mut self, text: impl ToString) -> Self {
+        self.text = text.to_string();
         self
     }
 
@@ -191,7 +163,7 @@ impl<'a> Slider<'a> {
     }
 
     /// If set to `true`, all incoming and outgoing values will be clamped to the slider range.
-    /// Default: `false`.
+    /// Default: `true`.
     pub fn clamp_to_range(mut self, clamp_to_range: bool) -> Self {
         self.clamp_to_range = clamp_to_range;
         self
@@ -202,11 +174,6 @@ impl<'a> Slider<'a> {
     pub fn smart_aim(mut self, smart_aim: bool) -> Self {
         self.smart_aim = smart_aim;
         self
-    }
-
-    #[deprecated = "Use fixed_decimals instead"]
-    pub fn precision(self, precision: usize) -> Self {
-        self.max_decimals(precision)
     }
 
     // TODO: we should also have a "min precision".
@@ -248,7 +215,9 @@ impl<'a> Slider<'a> {
     fn get_value(&mut self) -> f64 {
         let value = get(&mut self.get_set_value);
         if self.clamp_to_range {
-            clamp(value, self.range.clone())
+            let start = *self.range.start();
+            let end = *self.range.end();
+            value.clamp(start.min(end), start.max(end))
         } else {
             value
         }
@@ -256,7 +225,9 @@ impl<'a> Slider<'a> {
 
     fn set_value(&mut self, mut value: f64) {
         if self.clamp_to_range {
-            value = clamp(value, self.range.clone());
+            let start = *self.range.start();
+            let end = *self.range.end();
+            value = value.clamp(start.min(end), start.max(end));
         }
         if let Some(max_decimals) = self.max_decimals {
             value = emath::round_to_decimals(value, max_decimals);
@@ -299,6 +270,7 @@ fn x_range(rect: &Rect) -> RangeInclusive<f32> {
 
 impl<'a> Slider<'a> {
     /// Just the slider, no text
+    #[allow(clippy::unused_self)]
     fn allocate_slider_space(&self, ui: &mut Ui, height: f32) -> Response {
         let desired_size = vec2(ui.spacing().slider_width, height);
         ui.allocate_response(desired_size, Sense::click_and_drag())
@@ -350,7 +322,10 @@ impl<'a> Slider<'a> {
         {
             let value = self.get_value();
 
-            let rail_radius = ui.painter().round_to_pixel((rect.height() / 8.0).max(2.0));
+            let rail_radius = ui
+                .painter()
+                .round_to_pixel((rect.height() / 4.0).at_least(2.0));
+
             let rail_rect = Rect::from_min_max(
                 pos2(rect.left(), rect.center().y - rail_radius),
                 pos2(rect.right(), rect.center().y + rail_radius),
@@ -358,10 +333,9 @@ impl<'a> Slider<'a> {
             let marker_center_x = self.x_from_value(value, x_range);
 
             let visuals = ui.style().interact(response);
-            ui.painter().add(Shape::Rect {
+            ui.painter().add(epaint::RectShape {
                 rect: rail_rect,
-                corner_radius: rail_radius,
-
+                corner_radius: ui.visuals().widgets.inactive.corner_radius,
                 fill: ui.visuals().widgets.inactive.bg_fill,
                 // fill: visuals.bg_fill,
                 // fill: ui.visuals().extreme_bg_color,
@@ -370,7 +344,7 @@ impl<'a> Slider<'a> {
                 // stroke: ui.visuals().widgets.inactive.bg_stroke,
             });
 
-            ui.painter().add(Shape::Circle {
+            ui.painter().add(epaint::CircleShape {
                 center: pos2(marker_center_x, rail_rect.center().y),
                 radius: handle_radius(rect) + visuals.expansion,
                 fill: visuals.bg_fill,
@@ -389,9 +363,9 @@ impl<'a> Slider<'a> {
     fn value_ui(&mut self, ui: &mut Ui, x_range: RangeInclusive<f32>) {
         let mut value = self.get_value();
         ui.add(
-            DragValue::f64(&mut value)
+            DragValue::new(&mut value)
                 .speed(self.current_gradient(&x_range))
-                .clamp_range_f64(self.clamp_range())
+                .clamp_range(self.clamp_range())
                 .min_decimals(self.min_decimals)
                 .max_decimals_opt(self.max_decimals)
                 .suffix(self.suffix.clone())
@@ -417,8 +391,10 @@ impl<'a> Slider<'a> {
 impl<'a> Widget for Slider<'a> {
     fn ui(mut self, ui: &mut Ui) -> Response {
         let text_style = TextStyle::Button;
-        let font = &ui.fonts()[text_style];
-        let height = font.row_height().at_least(ui.spacing().interact_size.y);
+        let height = ui
+            .fonts()
+            .row_height(text_style)
+            .at_least(ui.spacing().interact_size.y);
 
         let old_value = self.get_value();
 
@@ -496,11 +472,11 @@ fn value_from_normalized(normalized: f64, range: RangeInclusive<f64>, spec: &Sli
             }
         }
     } else {
-        debug_assert!(
+        crate::egui_assert!(
             min.is_finite() && max.is_finite(),
             "You should use a logarithmic range"
         );
-        lerp(range, clamp(normalized, 0.0..=1.0))
+        lerp(range, normalized.clamp(0.0, 1.0))
     }
 }
 
@@ -545,7 +521,7 @@ fn normalized_from_value(value: f64, range: RangeInclusive<f64>, spec: &SliderSp
             }
         }
     } else {
-        debug_assert!(
+        crate::egui_assert!(
             min.is_finite() && max.is_finite(),
             "You should use a logarithmic range"
         );
@@ -593,6 +569,6 @@ fn logaritmic_zero_cutoff(min: f64, max: f64) -> f64 {
     };
 
     let cutoff = min_magnitude / (min_magnitude + max_magnitude);
-    debug_assert!(0.0 <= cutoff && cutoff <= 1.0);
+    crate::egui_assert!(0.0 <= cutoff && cutoff <= 1.0);
     cutoff
 }

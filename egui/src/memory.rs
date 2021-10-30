@@ -1,10 +1,6 @@
-use std::collections::{HashMap, HashSet};
+use epaint::ahash::AHashSet;
 
-use crate::{
-    area, collapsing_header, menu, resize, scroll_area, util::Cache, widgets::text_edit, window,
-    Id, InputState, LayerId, Pos2, Rect, Style,
-};
-use epaint::color::{Color32, Hsva};
+use crate::{area, window, Id, IdMap, InputState, LayerId, Pos2, Rect, Style};
 
 // ----------------------------------------------------------------------------
 
@@ -14,26 +10,60 @@ use epaint::color::{Color32, Hsva};
 /// how far the user has scrolled in a `ScrollArea` etc.
 ///
 /// If you want this to persist when closing your app you should serialize `Memory` and store it.
+/// For this you need to enable the `persistence`.
+///
+/// If you want to store data for your widgets, you should look at [`Memory::data`]
 #[derive(Clone, Debug, Default)]
 #[cfg_attr(feature = "persistence", derive(serde::Deserialize, serde::Serialize))]
 #[cfg_attr(feature = "persistence", serde(default))]
 pub struct Memory {
-    pub(crate) options: Options,
+    pub options: Options,
 
+    /// This map stores current states for all widgets with custom `Id`s.
+    ///
+    /// This will be saved between different program runs if you use the `persistence` feature.
+    ///
+    /// To store a state common for all your widgets (a singleton), use [`Id::null`] as the key.
+    pub data: crate::util::IdTypeMap,
+
+    // ------------------------------------------
+    /// Can be used to cache computations from one frame to another.
+    ///
+    /// This is for saving CPU when you have something that may take 1-100ms to compute.
+    /// Things that are very slow (>100ms) should instead be done async (i.e. in another thread)
+    /// so as not to lock the UI thread.
+    ///
+    /// ```
+    /// use egui::util::cache::{ComputerMut, FrameCache};
+    ///
+    /// #[derive(Default)]
+    /// struct CharCounter {}
+    /// impl ComputerMut<&str, usize> for CharCounter {
+    ///     fn compute(&mut self, s: &str) -> usize {
+    ///         s.chars().count() // you probably want to cache something more expensive than this
+    ///     }
+    /// }
+    /// type CharCountCache<'a> = FrameCache<usize, CharCounter>;
+    ///
+    /// # let mut ctx = egui::CtxRef::default();
+    /// let mut memory = ctx.memory();
+    /// let cache = memory.caches.cache::<CharCountCache<'_>>();
+    /// assert_eq!(cache.get("hello"), 5);
+    /// ```
+    #[cfg_attr(feature = "persistence", serde(skip))]
+    pub caches: crate::util::cache::CacheStorage,
+
+    // ------------------------------------------
     /// new scale that will be applied at the start of the next frame
+    #[cfg_attr(feature = "persistence", serde(skip))]
     pub(crate) new_pixels_per_point: Option<f32>,
+
+    /// new fonts that will be applied at the start of the next frame
+    #[cfg_attr(feature = "persistence", serde(skip))]
+    pub(crate) new_font_definitions: Option<epaint::text::FontDefinitions>,
 
     #[cfg_attr(feature = "persistence", serde(skip))]
     pub(crate) interaction: Interaction,
-
-    // states of various types of widgets
-    pub(crate) collapsing_headers: HashMap<Id, collapsing_header::State>,
-    pub(crate) grid: HashMap<Id, crate::grid::State>,
-    #[cfg_attr(feature = "persistence", serde(skip))]
-    pub(crate) menu_bar: HashMap<Id, menu::BarState>,
-    pub(crate) resize: HashMap<Id, resize::State>,
-    pub(crate) scroll_areas: HashMap<Id, scroll_area::State>,
-    pub(crate) text_edit: HashMap<Id, text_edit::State>,
 
     #[cfg_attr(feature = "persistence", serde(skip))]
     pub(crate) window_interaction: Option<window::WindowInteraction>,
@@ -41,14 +71,7 @@ pub struct Memory {
     #[cfg_attr(feature = "persistence", serde(skip))]
     pub(crate) drag_value: crate::widgets::drag_value::MonoState,
 
-    #[cfg_attr(feature = "persistence", serde(skip))]
-    pub(crate) tooltip: crate::containers::popup::MonoState,
-
     pub(crate) areas: Areas,
-
-    /// Used by color picker
-    #[cfg_attr(feature = "persistence", serde(skip))]
-    pub(crate) color_cache: Cache<Color32, Hsva>,
 
     /// Which popup-window is open (if any)?
     /// Could be a combo box, color picker, menu etc.
@@ -61,17 +84,22 @@ pub struct Memory {
 
 // ----------------------------------------------------------------------------
 
+/// Some global options that you can read and write.
 #[derive(Clone, Debug, Default)]
-#[cfg_attr(feature = "persistence", derive(serde::Deserialize, serde::Serialize))]
-#[cfg_attr(feature = "persistence", serde(default))]
-pub(crate) struct Options {
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(default))]
+pub struct Options {
     /// The default style for new `Ui`:s.
-    #[cfg_attr(feature = "persistence", serde(skip))]
+    #[cfg_attr(feature = "serde", serde(skip))]
     pub(crate) style: std::sync::Arc<Style>,
+
     /// Controls the tessellator.
-    pub(crate) tessellation_options: epaint::TessellationOptions,
-    /// Font sizes etc.
-    pub(crate) font_definitions: epaint::text::FontDefinitions,
+    pub tessellation_options: epaint::TessellationOptions,
+
+    /// This does not at all change the behavior of egui,
+    /// but is a signal to any backend that we want the [`crate::Output::events`] read out loud.
+    /// Screen readers is an experimental feature of egui, and not supported on all platforms.
+    pub screen_reader: bool,
 }
 
 // ----------------------------------------------------------------------------
@@ -128,8 +156,12 @@ pub(crate) struct Focus {
     /// The last widget interested in focus.
     last_interested: Option<Id>,
 
+    /// If `true`, pressing tab will NOT move focus away from the current widget.
+    is_focus_locked: bool,
+
     /// Set at the beginning of the frame, set to `false` when "used".
     pressed_tab: bool,
+
     /// Set at the beginning of the frame, set to `false` when "used".
     pressed_shift_tab: bool,
 }
@@ -186,6 +218,7 @@ impl Focus {
                 }
             ) {
                 self.id = None;
+                self.is_focus_locked = false;
                 break;
             }
 
@@ -195,16 +228,18 @@ impl Focus {
                 modifiers,
             } = event
             {
-                if modifiers.shift {
-                    self.pressed_shift_tab = true;
-                } else {
-                    self.pressed_tab = true;
+                if !self.is_focus_locked {
+                    if modifiers.shift {
+                        self.pressed_shift_tab = true;
+                    } else {
+                        self.pressed_tab = true;
+                    }
                 }
             }
         }
     }
 
-    pub(crate) fn end_frame(&mut self, used_ids: &epaint::ahash::AHashMap<Id, Pos2>) {
+    pub(crate) fn end_frame(&mut self, used_ids: &IdMap<Rect>) {
         if let Some(id) = self.id {
             // Allow calling `request_focus` one frame and not using it until next frame
             let recently_gained_focus = self.id_previous_frame != Some(id);
@@ -225,11 +260,11 @@ impl Focus {
             self.id = Some(id);
             self.give_to_next = false;
         } else if self.id == Some(id) {
-            if self.pressed_tab {
+            if self.pressed_tab && !self.is_focus_locked {
                 self.id = None;
                 self.give_to_next = true;
                 self.pressed_tab = false;
-            } else if self.pressed_shift_tab {
+            } else if self.pressed_shift_tab && !self.is_focus_locked {
                 self.id_next_frame = self.last_interested; // frame-delay so gained_focus works
                 self.pressed_shift_tab = false;
             }
@@ -255,16 +290,14 @@ impl Memory {
         }
     }
 
-    pub(crate) fn end_frame(
-        &mut self,
-        input: &InputState,
-        used_ids: &epaint::ahash::AHashMap<Id, Pos2>,
-    ) {
+    pub(crate) fn end_frame(&mut self, input: &InputState, used_ids: &IdMap<Rect>) {
+        self.caches.update();
         self.areas.end_frame();
         self.interaction.focus.end_frame(used_ids);
         self.drag_value.end_frame(input);
     }
 
+    /// Top-most layer at the given position.
     pub fn layer_id_at(&self, pos: Pos2, resize_interact_radius_side: f32) -> Option<LayerId> {
         self.areas.layer_id_at(pos, resize_interact_radius_side)
     }
@@ -283,36 +316,68 @@ impl Memory {
         !self.had_focus_last_frame(id) && self.has_focus(id)
     }
 
-    pub(crate) fn has_focus(&self, id: Id) -> bool {
+    /// Does this widget have keyboard focus?
+    #[inline(always)]
+    pub fn has_focus(&self, id: Id) -> bool {
         self.interaction.focus.id == Some(id)
     }
 
-    /// Give keyboard focus to a specific widget
-    pub fn request_focus(&mut self, id: Id) {
-        self.interaction.focus.id = Some(id);
+    /// Which widget has keyboard focus?
+    pub fn focus(&self) -> Option<Id> {
+        self.interaction.focus.id
     }
 
+    pub(crate) fn lock_focus(&mut self, id: Id, lock_focus: bool) {
+        if self.had_focus_last_frame(id) && self.has_focus(id) {
+            self.interaction.focus.is_focus_locked = lock_focus;
+        }
+    }
+
+    pub(crate) fn has_lock_focus(&mut self, id: Id) -> bool {
+        if self.had_focus_last_frame(id) && self.has_focus(id) {
+            self.interaction.focus.is_focus_locked
+        } else {
+            false
+        }
+    }
+
+    /// Give keyboard focus to a specific widget.
+    /// See also [`crate::Response::request_focus`].
+    #[inline(always)]
+    pub fn request_focus(&mut self, id: Id) {
+        self.interaction.focus.id = Some(id);
+        self.interaction.focus.is_focus_locked = false;
+    }
+
+    /// Surrender keyboard focus for a specific widget.
+    /// See also [`crate::Response::surrender_focus`].
+    #[inline(always)]
     pub fn surrender_focus(&mut self, id: Id) {
         if self.interaction.focus.id == Some(id) {
             self.interaction.focus.id = None;
+            self.interaction.focus.is_focus_locked = false;
         }
     }
 
     /// Register this widget as being interested in getting keyboard focus.
     /// This will allow the user to select it with tab and shift-tab.
+    #[inline(always)]
     pub(crate) fn interested_in_focus(&mut self, id: Id) {
         self.interaction.focus.interested_in_focus(id);
     }
 
     /// Stop editing of active `TextEdit` (if any).
+    #[inline(always)]
     pub fn stop_text_input(&mut self) {
         self.interaction.focus.id = None;
     }
 
+    #[inline(always)]
     pub fn is_anything_being_dragged(&self) -> bool {
         self.interaction.drag_id.is_some()
     }
 
+    #[inline(always)]
     pub fn is_being_dragged(&self, id: Id) -> bool {
         self.interaction.drag_id == Some(id)
     }
@@ -353,6 +418,7 @@ impl Memory {
     /// This is useful for testing, benchmarking, pre-caching, etc.
     ///
     /// Experimental feature!
+    #[inline(always)]
     pub fn everything_is_visible(&self) -> bool {
         self.everything_is_visible
     }
@@ -372,21 +438,21 @@ impl Memory {
 /// Keeps track of `Area`s, which are free-floating `Ui`s.
 /// These `Area`s can be in any `Order`.
 #[derive(Clone, Debug, Default)]
-#[cfg_attr(feature = "persistence", derive(serde::Deserialize, serde::Serialize))]
-#[cfg_attr(feature = "persistence", serde(default))]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(default))]
 pub struct Areas {
-    areas: HashMap<Id, area::State>,
-    /// Top is last
+    areas: IdMap<area::State>,
+    /// Back-to-front. Top is last.
     order: Vec<LayerId>,
-    visible_last_frame: HashSet<LayerId>,
-    visible_current_frame: HashSet<LayerId>,
+    visible_last_frame: AHashSet<LayerId>,
+    visible_current_frame: AHashSet<LayerId>,
 
     /// When an area want to be on top, it is put in here.
     /// At the end of the frame, this is used to reorder the layers.
     /// This means if several layers want to be on top, they will keep their relative order.
     /// So if you close three windows and then reopen them all in one frame,
     /// they will all be sent to the top, but keep their previous internal order.
-    wants_to_be_on_top: HashSet<LayerId>,
+    wants_to_be_on_top: AHashSet<LayerId>,
 }
 
 impl Areas {
@@ -398,6 +464,7 @@ impl Areas {
         self.areas.get(&id)
     }
 
+    /// Back-to-front. Top is last.
     pub(crate) fn order(&self) -> &[LayerId] {
         &self.order
     }
@@ -405,22 +472,23 @@ impl Areas {
     pub(crate) fn set_state(&mut self, layer_id: LayerId, state: area::State) {
         self.visible_current_frame.insert(layer_id);
         self.areas.insert(layer_id.id, state);
-        if self.order.iter().find(|x| **x == layer_id).is_none() {
+        if !self.order.iter().any(|x| *x == layer_id) {
             self.order.push(layer_id);
         }
     }
 
+    /// Top-most layer at the given position.
     pub fn layer_id_at(&self, pos: Pos2, resize_interact_radius_side: f32) -> Option<LayerId> {
         for layer in self.order.iter().rev() {
             if self.is_visible(layer) {
                 if let Some(state) = self.areas.get(&layer.id) {
+                    let mut rect = state.rect();
                     if state.interactable {
-                        let rect = Rect::from_min_size(state.pos, state.size);
                         // Allow us to resize by dragging just outside the window:
-                        let rect = rect.expand(resize_interact_radius_side);
-                        if rect.contains(pos) {
-                            return Some(*layer);
-                        }
+                        rect = rect.expand(resize_interact_radius_side);
+                    }
+                    if rect.contains(pos) {
+                        return Some(*layer);
                     }
                 }
             }
@@ -436,7 +504,7 @@ impl Areas {
         self.visible_last_frame.contains(layer_id) || self.visible_current_frame.contains(layer_id)
     }
 
-    pub fn visible_layer_ids(&self) -> HashSet<LayerId> {
+    pub fn visible_layer_ids(&self) -> AHashSet<LayerId> {
         self.visible_last_frame
             .iter()
             .cloned()
@@ -456,7 +524,7 @@ impl Areas {
         self.visible_current_frame.insert(layer_id);
         self.wants_to_be_on_top.insert(layer_id);
 
-        if self.order.iter().find(|x| **x == layer_id).is_none() {
+        if !self.order.iter().any(|x| *x == layer_id) {
             self.order.push(layer_id);
         }
     }
@@ -474,4 +542,13 @@ impl Areas {
         order.sort_by_key(|layer| (layer.order, wants_to_be_on_top.contains(layer)));
         wants_to_be_on_top.clear();
     }
+}
+
+// ----------------------------------------------------------------------------
+
+#[cfg(test)]
+#[test]
+fn memory_impl_send_sync() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Memory>();
 }

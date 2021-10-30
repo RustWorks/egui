@@ -11,7 +11,7 @@
 
 You can ask questions, share screenshots and more at [GitHub Discussions](https://github.com/emilk/egui/discussions).
 
-There is also an `egui` channel on the Embark discord at <https://discord.gg/vY8ZGS292W> (NOTE: I work at [Embark](https://www.embark-studios.com/), but `egui` is my hobby project).
+There is an `egui` discord at <https://discord.gg/vbuv9Xan65>.
 
 
 ## Filing an issue
@@ -29,8 +29,15 @@ First file an issue (or find an existing one) and announce that you plan to work
 
 Browse through [`ARCHITECTURE.md`](https://github.com/emilk/egui/blob/master/ARCHITECTURE.md) to get a sense of how all pieces connects.
 
+You can test your code locally by running `./sh/check.sh`.
+
 When you have something that works, open a draft PR. You may get some helpful feedback early!
 When you feel the PR is ready to go, do a self-review of the code, and then open it for review.
+
+Please keep pull requests small and focused.
+
+Do not include the `.js` and `.wasm` build artifacts generated for building for web.
+`git` is not great at storing large files like these, so we only commit a new web demo after a new egui release.
 
 
 ## Creating an integration for egui

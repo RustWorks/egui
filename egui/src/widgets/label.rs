@@ -1,5 +1,9 @@
 use crate::*;
-use epaint::Galley;
+use epaint::{
+    text::{LayoutJob, LayoutSection, TextFormat},
+    Galley,
+};
+use std::sync::Arc;
 
 /// Static text.
 ///
@@ -23,12 +27,15 @@ pub struct Label {
     strikethrough: bool,
     underline: bool,
     italics: bool,
+    raised: bool,
+    sense: Sense,
 }
 
 impl Label {
-    pub fn new(text: impl Into<String>) -> Self {
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn new(text: impl ToString) -> Self {
         Self {
-            text: text.into(),
+            text: text.to_string(),
             wrap: None,
             text_style: None,
             background_color: Color32::TRANSPARENT,
@@ -39,6 +46,8 @@ impl Label {
             strikethrough: false,
             underline: false,
             italics: false,
+            raised: false,
+            sense: Sense::focusable_noninteractive(),
         }
     }
 
@@ -55,11 +64,6 @@ impl Label {
     pub fn wrap(mut self, wrap: bool) -> Self {
         self.wrap = Some(wrap);
         self
-    }
-
-    #[deprecated = "Use Label::wrap instead"]
-    pub fn multiline(self, multiline: bool) -> Self {
-        self.wrap(multiline)
     }
 
     /// The default is [`Style::body_text_style`] (generally [`TextStyle::Body`]).
@@ -112,8 +116,20 @@ impl Label {
         self
     }
 
+    /// Smaller text
     pub fn small(self) -> Self {
         self.text_style(TextStyle::Small)
+    }
+
+    /// For e.g. exponents
+    pub fn small_raised(self) -> Self {
+        self.text_style(TextStyle::Small).raised()
+    }
+
+    /// Align text to top. Only applicable together with [`Self::small()`].
+    pub fn raised(mut self) -> Self {
+        self.raised = true;
+        self
     }
 
     /// Fill-color behind the text
@@ -126,28 +142,153 @@ impl Label {
         self.text_color = Some(text_color.into());
         self
     }
+
+    /// Make the label respond to clicks and/or drags.
+    ///
+    /// By default, a label is inert and does not respond to click or drags.
+    /// By calling this you can turn the label into a button of sorts.
+    /// This will also give the label the hover-effect of a button, but without the frame.
+    ///
+    /// ``` rust
+    /// # use egui::{Label, Sense};
+    /// # let ui = &mut egui::Ui::__test();
+    /// if ui.add(Label::new("click me").sense(Sense::click())).clicked() {
+    ///     /* … */
+    /// }
+    /// ```
+    pub fn sense(mut self, sense: Sense) -> Self {
+        self.sense = sense;
+        self
+    }
 }
 
 impl Label {
-    pub fn layout(&self, ui: &Ui) -> Galley {
+    pub fn layout(&self, ui: &Ui) -> Arc<Galley> {
         let max_width = ui.available_width();
-        self.layout_width(ui, max_width)
+        let line_color = self.get_text_color(ui, ui.visuals().text_color());
+        self.layout_width(ui, max_width, line_color)
     }
 
-    pub fn layout_width(&self, ui: &Ui, max_width: f32) -> Galley {
+    /// `line_color`: used for underline and strikethrough, if any.
+    pub fn layout_width(&self, ui: &Ui, max_width: f32, line_color: Color32) -> Arc<Galley> {
+        let (halign, justify) = if ui.is_grid() {
+            (Align::LEFT, false) // TODO: remove special Grid hacks like these
+        } else {
+            (
+                ui.layout().horizontal_placement(),
+                ui.layout().horizontal_justify(),
+            )
+        };
+        self.layout_impl(ui, 0.0, max_width, 0.0, line_color, halign, justify)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn layout_impl(
+        &self,
+        ui: &Ui,
+        leading_space: f32,
+        max_width: f32,
+        first_row_min_height: f32,
+        line_color: Color32,
+        halign: Align,
+        justify: bool,
+    ) -> Arc<Galley> {
         let text_style = self.text_style_or_default(ui.style());
-        let font = &ui.fonts()[text_style];
         let wrap_width = if self.should_wrap(ui) {
             max_width
         } else {
             f32::INFINITY
         };
-        font.layout_multiline(self.text.clone(), wrap_width) // TODO: avoid clone
+
+        let mut background_color = self.background_color;
+        if self.code {
+            background_color = ui.visuals().code_bg_color;
+        }
+        let underline = if self.underline {
+            Stroke::new(1.0, line_color)
+        } else {
+            Stroke::none()
+        };
+        let strikethrough = if self.strikethrough {
+            Stroke::new(1.0, line_color)
+        } else {
+            Stroke::none()
+        };
+
+        let valign = if self.raised {
+            Align::TOP
+        } else {
+            ui.layout().vertical_align()
+        };
+
+        let job = LayoutJob {
+            text: self.text.clone(), // TODO: avoid clone
+            sections: vec![LayoutSection {
+                leading_space,
+                byte_range: 0..self.text.len(),
+                format: TextFormat {
+                    style: text_style,
+                    color: Color32::TEMPORARY_COLOR,
+                    background: background_color,
+                    italics: self.italics,
+                    underline,
+                    strikethrough,
+                    valign,
+                },
+            }],
+            wrap_width,
+            first_row_min_height,
+            halign,
+            justify,
+            ..Default::default()
+        };
+
+        ui.fonts().layout_job(job)
+    }
+
+    /// `has_focus`: the item is selected with the keyboard, so highlight with underline.
+    /// `response_color`: Unless we have a special color set, use this.
+    pub(crate) fn paint_galley(
+        &self,
+        ui: &mut Ui,
+        pos: Pos2,
+        galley: Arc<Galley>,
+        has_focus: bool,
+        response_color: Color32,
+    ) {
+        let text_color = self.get_text_color(ui, response_color);
+
+        let underline = if has_focus {
+            Stroke::new(1.0, text_color)
+        } else {
+            Stroke::none()
+        };
+
+        ui.painter().add(epaint::TextShape {
+            pos,
+            galley,
+            override_text_color: Some(text_color),
+            underline,
+            angle: 0.0,
+        });
+    }
+
+    /// `response_color`: Unless we have a special color set, use this.
+    fn get_text_color(&self, ui: &Ui, response_color: Color32) -> Color32 {
+        if let Some(text_color) = self.text_color {
+            text_color
+        } else if self.strong {
+            ui.visuals().strong_text_color()
+        } else if self.weak {
+            ui.visuals().weak_text_color()
+        } else {
+            response_color
+        }
     }
 
     pub fn font_height(&self, fonts: &epaint::text::Fonts, style: &Style) -> f32 {
         let text_style = self.text_style_or_default(style);
-        fonts[text_style].row_height()
+        fonts.row_height(text_style)
     }
 
     // TODO: this should return a LabelLayout which has a paint method.
@@ -158,75 +299,11 @@ impl Label {
     // TODO: a paint method for painting anywhere in a ui.
     // This should be the easiest method of putting text anywhere.
 
-    pub fn paint_galley(&self, ui: &mut Ui, pos: Pos2, galley: Galley) {
-        self.paint_galley_focus(ui, pos, galley, false)
-    }
-
-    fn paint_galley_focus(&self, ui: &mut Ui, pos: Pos2, galley: Galley, focus: bool) {
-        let Self {
-            mut background_color,
-            code,
-            strong,
-            weak,
-            strikethrough,
-            underline,
-            italics,
-            ..
-        } = *self;
-
-        let underline = underline || focus;
-
-        let text_color = if let Some(text_color) = self.text_color {
-            text_color
-        } else if strong {
-            ui.visuals().strong_text_color()
-        } else if weak {
-            ui.visuals().weak_text_color()
-        } else {
-            ui.visuals().text_color()
-        };
-
-        if code {
-            background_color = ui.visuals().code_bg_color;
-        }
-
-        let mut lines = vec![];
-
-        if strikethrough || underline || background_color != Color32::TRANSPARENT {
-            for row in &galley.rows {
-                let rect = row.rect().translate(pos.to_vec2());
-
-                if background_color != Color32::TRANSPARENT {
-                    let rect = rect.expand(1.0); // looks better
-                    ui.painter().rect_filled(rect, 0.0, background_color);
-                }
-
-                let stroke_width = 1.0;
-                if strikethrough {
-                    lines.push(Shape::line_segment(
-                        [rect.left_center(), rect.right_center()],
-                        (stroke_width, text_color),
-                    ));
-                }
-                if underline {
-                    lines.push(Shape::line_segment(
-                        [rect.left_bottom(), rect.right_bottom()],
-                        (stroke_width, text_color),
-                    ));
-                }
-            }
-        }
-
-        let text_style = self.text_style_or_default(ui.style());
-        ui.painter()
-            .galley_with_italics(pos, galley, text_style, text_color, italics);
-
-        ui.painter().extend(lines);
-    }
-
     /// Read the text style, or get the default for the current style
     pub fn text_style_or_default(&self, style: &Style) -> TextStyle {
-        self.text_style.unwrap_or(style.body_text_style)
+        self.text_style
+            .or(style.override_text_style)
+            .unwrap_or(style.body_text_style)
     }
 
     fn should_wrap(&self, ui: &Ui) -> bool {
@@ -239,80 +316,85 @@ impl Label {
             }
         })
     }
-}
 
-impl Widget for Label {
-    fn ui(self, ui: &mut Ui) -> Response {
-        let sense = Sense::focusable_noninteractive();
+    /// Do layout and place the galley in the ui, without painting it or adding widget info.
+    pub(crate) fn layout_in_ui(&self, ui: &mut Ui) -> (Pos2, Arc<Galley>, Response) {
+        let sense = self.sense;
+        let max_width = ui.available_width();
 
         if self.should_wrap(ui)
             && ui.layout().main_dir() == Direction::LeftToRight
             && ui.layout().main_wrap()
+            && max_width.is_finite()
         {
-            // On a wrapping horizontal layout we want text to start after the last widget,
+            // On a wrapping horizontal layout we want text to start after the previous widget,
             // then continue on the line below! This will take some extra work:
 
-            let max_width = ui.available_width();
+            let cursor = ui.cursor();
             let first_row_indentation = max_width - ui.available_size_before_wrap().x;
+            egui_assert!(first_row_indentation.is_finite());
 
-            let text_style = self.text_style_or_default(ui.style());
-            let font = &ui.fonts()[text_style];
-            let mut galley = font.layout_multiline_with_indentation_and_max_width(
-                self.text.clone(),
+            let first_row_min_height = cursor.height();
+            let default_color = self.get_text_color(ui, ui.visuals().text_color());
+            let halign = Align::Min;
+            let justify = false;
+            let galley = self.layout_impl(
+                ui,
                 first_row_indentation,
                 max_width,
+                first_row_min_height,
+                default_color,
+                halign,
+                justify,
             );
 
-            let pos = pos2(ui.min_rect().left(), ui.cursor().y);
-
+            let pos = pos2(ui.max_rect().left(), ui.cursor().top());
             assert!(!galley.rows.is_empty(), "Galleys are never empty");
-            let rect = galley.rows[0].rect().translate(vec2(pos.x, pos.y));
-            let id = ui.advance_cursor_after_rect(rect);
-            let mut response = ui.interact(rect, id, sense);
-
-            let mut y_translation = 0.0;
-            if let Some(row) = galley.rows.get(1) {
-                // We could be sharing the first row with e.g. a button, that is higher than text.
-                // So we need to compensate for that:
-                if pos.y + row.y_min < ui.min_rect().bottom() {
-                    y_translation = ui.min_rect().bottom() - row.y_min - pos.y;
-                }
+            // collect a response from many rows:
+            let rect = galley.rows[0].rect.translate(vec2(pos.x, pos.y));
+            let mut response = ui.allocate_rect(rect, sense);
+            for row in galley.rows.iter().skip(1) {
+                let rect = row.rect.translate(vec2(pos.x, pos.y));
+                response |= ui.allocate_rect(rect, sense);
             }
-
-            for row in galley.rows.iter_mut().skip(1) {
-                row.y_min += y_translation;
-                row.y_max += y_translation;
-                let rect = row.rect().translate(vec2(pos.x, pos.y));
-                ui.advance_cursor_after_rect(rect);
-                response |= ui.interact(rect, id, sense);
-            }
-            response.widget_info(|| WidgetInfo::labeled(WidgetType::Label, &galley.text));
-            self.paint_galley_focus(ui, pos, galley, response.has_focus());
-            response
+            (pos, galley, response)
         } else {
             let galley = self.layout(ui);
-            let (rect, response) = ui.allocate_exact_size(galley.size, sense);
-            response.widget_info(|| WidgetInfo::labeled(WidgetType::Label, &galley.text));
-            self.paint_galley_focus(ui, rect.min, galley, response.has_focus());
-            response
+            let (rect, response) = ui.allocate_exact_size(galley.size(), sense);
+            let pos = match galley.job.halign {
+                Align::LEFT => rect.left_top(),
+                Align::Center => rect.center_top(),
+                Align::RIGHT => rect.right_top(),
+            };
+            (pos, galley, response)
         }
     }
 }
 
-impl Into<Label> for &str {
-    fn into(self) -> Label {
-        Label::new(self)
+impl Widget for Label {
+    fn ui(self, ui: &mut Ui) -> Response {
+        let (pos, galley, response) = self.layout_in_ui(ui);
+        response.widget_info(|| WidgetInfo::labeled(WidgetType::Label, galley.text()));
+        let response_color = ui.style().interact(&response).text_color();
+        self.paint_galley(ui, pos, galley, response.has_focus(), response_color);
+        response
     }
 }
 
-impl Into<Label> for &String {
-    fn into(self) -> Label {
-        Label::new(self)
+impl From<&str> for Label {
+    fn from(s: &str) -> Label {
+        Label::new(s)
     }
 }
 
-impl Into<Label> for String {
-    fn into(self) -> Label {
-        Label::new(self)
+impl From<&String> for Label {
+    fn from(s: &String) -> Label {
+        Label::new(s)
+    }
+}
+
+impl From<String> for Label {
+    fn from(s: String) -> Label {
+        Label::new(s)
     }
 }

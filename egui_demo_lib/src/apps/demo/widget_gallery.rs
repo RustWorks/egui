@@ -1,30 +1,35 @@
 #[derive(Debug, PartialEq)]
-#[cfg_attr(feature = "persistence", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 enum Enum {
     First,
     Second,
     Third,
 }
 
-#[cfg_attr(feature = "persistence", derive(serde::Deserialize, serde::Serialize))]
+/// Shows off one example of each major type of widget.
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct WidgetGallery {
     enabled: bool,
+    visible: bool,
     boolean: bool,
     radio: Enum,
     scalar: f32,
     string: String,
     color: egui::Color32,
+    animate_progress_bar: bool,
 }
 
 impl Default for WidgetGallery {
     fn default() -> Self {
         Self {
             enabled: true,
+            visible: true,
             boolean: false,
             radio: Enum::First,
             scalar: 42.0,
             string: Default::default(),
             color: egui::Color32::LIGHT_BLUE.linear_multiply(0.5),
+            animate_progress_bar: false,
         }
     }
 }
@@ -37,9 +42,10 @@ impl super::Demo for WidgetGallery {
     fn show(&mut self, ctx: &egui::CtxRef, open: &mut bool) {
         egui::Window::new(self.name())
             .open(open)
-            .resizable(false)
+            .resizable(true)
+            .default_width(300.0)
             .show(ctx, |ui| {
-                use super::View;
+                use super::View as _;
                 self.ui(ui);
             });
     }
@@ -47,13 +53,27 @@ impl super::Demo for WidgetGallery {
 
 impl super::View for WidgetGallery {
     fn ui(&mut self, ui: &mut egui::Ui) {
-        self.gallery(ui);
+        ui.add_enabled_ui(self.enabled, |ui| {
+            ui.set_visible(self.visible);
+
+            egui::Grid::new("my_grid")
+                .num_columns(2)
+                .spacing([40.0, 4.0])
+                .striped(true)
+                .show(ui, |ui| {
+                    self.gallery_grid_contents(ui);
+                });
+        });
 
         ui.separator();
 
-        ui.vertical_centered(|ui| {
-            ui.checkbox(&mut self.enabled, "Interactive")
-                .on_hover_text("Convenient way to inspect how the widgets look when disabled.");
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.visible, "Visible")
+                .on_hover_text("Uncheck to hide all the widgets.");
+            if self.visible {
+                ui.checkbox(&mut self.enabled, "Interactive")
+                    .on_hover_text("Uncheck to inspect how the widgets look when disabled.");
+            }
         });
 
         ui.separator();
@@ -69,26 +89,17 @@ impl super::View for WidgetGallery {
 }
 
 impl WidgetGallery {
-    fn gallery(&mut self, ui: &mut egui::Ui) {
-        egui::Grid::new("my_grid")
-            .striped(true)
-            .spacing([40.0, 4.0])
-            .show(ui, |ui| {
-                self.gallery_grid_contents(ui);
-            });
-    }
-
     fn gallery_grid_contents(&mut self, ui: &mut egui::Ui) {
         let Self {
-            enabled,
+            enabled: _,
+            visible: _,
             boolean,
             radio,
             scalar,
             string,
             color,
+            animate_progress_bar,
         } = self;
-
-        ui.set_enabled(*enabled);
 
         ui.add(doc_link_label("Label", "label,heading"));
         ui.label("Welcome to the widget gallery!");
@@ -135,20 +146,34 @@ impl WidgetGallery {
         });
         ui.end_row();
 
-        ui.add(doc_link_label("Combo box", "combo_box"));
-        egui::combo_box_with_label(ui, "Take your pick", format!("{:?}", radio), |ui| {
-            ui.selectable_value(radio, Enum::First, "First");
-            ui.selectable_value(radio, Enum::Second, "Second");
-            ui.selectable_value(radio, Enum::Third, "Third");
-        });
+        ui.add(doc_link_label("ComboBox", "ComboBox"));
+
+        egui::ComboBox::from_label("Take your pick")
+            .selected_text(format!("{:?}", radio))
+            .show_ui(ui, |ui| {
+                ui.selectable_value(radio, Enum::First, "First");
+                ui.selectable_value(radio, Enum::Second, "Second");
+                ui.selectable_value(radio, Enum::Third, "Third");
+            });
         ui.end_row();
 
         ui.add(doc_link_label("Slider", "Slider"));
-        ui.add(egui::Slider::f32(scalar, 0.0..=360.0).suffix("°"));
+        ui.add(egui::Slider::new(scalar, 0.0..=360.0).suffix("°"));
         ui.end_row();
 
         ui.add(doc_link_label("DragValue", "DragValue"));
-        ui.add(egui::DragValue::f32(scalar).speed(1.0));
+        ui.add(egui::DragValue::new(scalar).speed(1.0));
+        ui.end_row();
+
+        ui.add(doc_link_label("ProgressBar", "ProgressBar"));
+        let progress = *scalar / 360.0;
+        let progress_bar = egui::ProgressBar::new(progress)
+            .show_percentage()
+            .animate(*animate_progress_bar);
+        *animate_progress_bar = ui
+            .add(progress_bar)
+            .on_hover_text("The progress bar can be animated!")
+            .hovered();
         ui.end_row();
 
         ui.add(doc_link_label("Color picker", "color_edit"));
@@ -176,7 +201,7 @@ impl WidgetGallery {
 
         ui.add(doc_link_label("CollapsingHeader", "collapsing"));
         ui.collapsing("Click to see what is hidden!", |ui| {
-            ui.horizontal_wrapped_for_text(egui::TextStyle::Body, |ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label(
                     "Not much, as it turns out - but here is a gold star for you for checking:",
                 );
@@ -187,6 +212,7 @@ impl WidgetGallery {
 
         ui.add(doc_link_label("Plot", "plot"));
         ui.add(example_plot());
+
         ui.end_row();
 
         ui.hyperlink_to(
@@ -202,14 +228,15 @@ impl WidgetGallery {
 }
 
 fn example_plot() -> egui::plot::Plot {
-    let n = 512;
-    let curve = egui::plot::Curve::from_values_iter((0..=n).map(|i| {
+    use egui::plot::{Line, Value, Values};
+    let n = 128;
+    let line = Line::new(Values::from_values_iter((0..=n).map(|i| {
         use std::f64::consts::TAU;
-        let x = egui::remap(i as f64, 0.0..=(n as f64), -TAU..=TAU);
-        egui::plot::Value::new(x, x.sin())
-    }));
-    egui::plot::Plot::default()
-        .curve(curve)
+        let x = egui::remap(i as f64, 0.0..=n as f64, -TAU..=TAU);
+        Value::new(x, x.sin())
+    })));
+    egui::plot::Plot::new("example_plot")
+        .line(line)
         .height(32.0)
         .data_aspect(1.0)
 }

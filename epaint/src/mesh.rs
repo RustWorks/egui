@@ -6,6 +6,8 @@ use emath::*;
 /// Should be friendly to send to GPU as is.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "bytemuck", derive(bytemuck::Pod, bytemuck::Zeroable))]
 pub struct Vertex {
     /// Logical pixel coordinates (points).
     /// (0,0) is the top left corner of the screen.
@@ -22,6 +24,7 @@ pub struct Vertex {
 
 /// Textured triangles in two dimensions.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct Mesh {
     /// Draw as triangles (i.e. the length is always multiple of three).
     ///
@@ -35,6 +38,7 @@ pub struct Mesh {
 
     /// The texture to use when drawing these triangles.
     pub texture_id: TextureId,
+    // TODO: bounding rectangle
 }
 
 impl Mesh {
@@ -60,8 +64,8 @@ impl Mesh {
 
     /// Are all indices within the bounds of the contained vertices?
     pub fn is_valid(&self) -> bool {
-        if self.vertices.len() <= u32::MAX as usize {
-            let n = self.vertices.len() as u32;
+        use std::convert::TryFrom;
+        if let Ok(n) = u32::try_from(self.vertices.len()) {
             self.indices.iter().all(|&i| i < n)
         } else {
             false
@@ -72,9 +76,18 @@ impl Mesh {
         self.indices.is_empty() && self.vertices.is_empty()
     }
 
+    /// Calculate a bounding rectangle.
+    pub fn calc_bounds(&self) -> Rect {
+        let mut bounds = Rect::NOTHING;
+        for v in &self.vertices {
+            bounds.extend_with(v.pos);
+        }
+        bounds
+    }
+
     /// Append all the indices and vertices of `other` to `self`.
     pub fn append(&mut self, other: Mesh) {
-        debug_assert!(other.is_valid());
+        crate::epaint_assert!(other.is_valid());
 
         if self.is_empty() {
             *self = other;
@@ -85,15 +98,15 @@ impl Mesh {
             );
 
             let index_offset = self.vertices.len() as u32;
-            for index in &other.indices {
-                self.indices.push(index_offset + index);
-            }
+            self.indices
+                .extend(other.indices.iter().map(|index| index + index_offset));
             self.vertices.extend(other.vertices.iter());
         }
     }
 
+    #[inline(always)]
     pub fn colored_vertex(&mut self, pos: Pos2, color: Color32) {
-        debug_assert!(self.texture_id == TextureId::Egui);
+        crate::epaint_assert!(self.texture_id == TextureId::Egui);
         self.vertices.push(Vertex {
             pos,
             uv: WHITE_UV,
@@ -102,6 +115,7 @@ impl Mesh {
     }
 
     /// Add a triangle.
+    #[inline(always)]
     pub fn add_triangle(&mut self, a: u32, b: u32, c: u32) {
         self.indices.push(a);
         self.indices.push(b);
@@ -110,12 +124,14 @@ impl Mesh {
 
     /// Make room for this many additional triangles (will reserve 3x as many indices).
     /// See also `reserve_vertices`.
+    #[inline(always)]
     pub fn reserve_triangles(&mut self, additional_triangles: usize) {
         self.indices.reserve(3 * additional_triangles);
     }
 
     /// Make room for this many additional vertices.
     /// See also `reserve_triangles`.
+    #[inline(always)]
     pub fn reserve_vertices(&mut self, additional: usize) {
         self.vertices.reserve(additional);
     }
@@ -151,9 +167,10 @@ impl Mesh {
     }
 
     /// Uniformly colored rectangle.
+    #[inline(always)]
     pub fn add_colored_rect(&mut self, rect: Rect, color: Color32) {
-        debug_assert!(self.texture_id == TextureId::Egui);
-        self.add_rect_with_uv(rect, [WHITE_UV, WHITE_UV].into(), color)
+        crate::epaint_assert!(self.texture_id == TextureId::Egui);
+        self.add_rect_with_uv(rect, [WHITE_UV, WHITE_UV].into(), color);
     }
 
     /// This is for platforms that only support 16-bit index buffers.
@@ -161,7 +178,7 @@ impl Mesh {
     /// Splits this mesh into many smaller meshes (if needed)
     /// where the smaller meshes have 16-bit indices.
     pub fn split_to_u16(self) -> Vec<Mesh16> {
-        debug_assert!(self.is_valid());
+        crate::epaint_assert!(self.is_valid());
 
         const MAX_SIZE: u32 = 1 << 16;
 
@@ -215,7 +232,7 @@ impl Mesh {
                 vertices: self.vertices[(min_vindex as usize)..=(max_vindex as usize)].to_vec(),
                 texture_id: self.texture_id,
             };
-            debug_assert!(mesh.is_valid());
+            crate::epaint_assert!(mesh.is_valid());
             output.push(mesh);
         }
         output
@@ -250,8 +267,8 @@ pub struct Mesh16 {
 impl Mesh16 {
     /// Are all indices within the bounds of the contained vertices?
     pub fn is_valid(&self) -> bool {
-        if self.vertices.len() <= u16::MAX as usize {
-            let n = self.vertices.len() as u16;
+        use std::convert::TryFrom;
+        if let Ok(n) = u16::try_from(self.vertices.len()) {
             self.indices.iter().all(|&i| i < n)
         } else {
             false

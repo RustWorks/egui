@@ -1,20 +1,19 @@
-use std::{
-    collections::BTreeMap,
-    hash::{Hash, Hasher},
-    sync::Arc,
-};
+use std::{collections::BTreeMap, sync::Arc};
 
 use crate::{
     mutex::Mutex,
-    text::font::{Font, FontImpl},
+    text::{
+        font::{Font, FontImpl},
+        Galley, LayoutJob,
+    },
     Texture, TextureAtlas,
 };
 
 // TODO: rename
 /// One of a few categories of styles of text, e.g. body, button or heading.
 #[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-#[cfg_attr(feature = "persistence", derive(serde::Deserialize, serde::Serialize))]
-#[cfg_attr(feature = "persistence", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum TextStyle {
     /// Used when small text is needed.
     Small,
@@ -44,8 +43,8 @@ impl TextStyle {
 
 /// Which style of font: [`Monospace`][`FontFamily::Monospace`] or [`Proportional`][`FontFamily::Proportional`].
 #[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-#[cfg_attr(feature = "persistence", derive(serde::Deserialize, serde::Serialize))]
-#[cfg_attr(feature = "persistence", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum FontFamily {
     /// A font where each character is the same width (`w` is the same width as `i`).
     Monospace,
@@ -56,12 +55,12 @@ pub enum FontFamily {
 /// The data of a `.ttf` or `.otf` file.
 pub type FontData = std::borrow::Cow<'static, [u8]>;
 
-fn rusttype_font_from_font_data(name: &str, data: &FontData) -> rusttype::Font<'static> {
+fn ab_glyph_font_from_font_data(name: &str, data: &FontData) -> ab_glyph::FontArc {
     match data {
-        std::borrow::Cow::Borrowed(bytes) => rusttype::Font::try_from_bytes(bytes),
-        std::borrow::Cow::Owned(bytes) => rusttype::Font::try_from_vec(bytes.clone()),
+        std::borrow::Cow::Borrowed(bytes) => ab_glyph::FontArc::try_from_slice(bytes),
+        std::borrow::Cow::Owned(bytes) => ab_glyph::FontArc::try_from_vec(bytes.clone()),
     }
-    .unwrap_or_else(|| panic!("Error parsing {:?} TTF/OTF font file", name))
+    .unwrap_or_else(|err| panic!("Error parsing {:?} TTF/OTF font file: {}", name, err))
 }
 
 /// Describes the font data and the sizes to use.
@@ -69,22 +68,52 @@ fn rusttype_font_from_font_data(name: &str, data: &FontData) -> rusttype::Font<'
 /// Often you would start with [`FontDefinitions::default()`] and then add/change the contents.
 ///
 /// ```
-/// let mut fonts = epaint::text::FontDefinitions::default();
+/// # use {epaint::text::{FontDefinitions, TextStyle, FontFamily}};
+/// # struct FakeEguiCtx {};
+/// # impl FakeEguiCtx { fn set_fonts(&self, _: FontDefinitions) {} }
+/// # let ctx = FakeEguiCtx {};
+/// let mut fonts = FontDefinitions::default();
+///
 /// // Large button text:
 /// fonts.family_and_size.insert(
-///     epaint::text::TextStyle::Button,
-///     (epaint::text::FontFamily::Proportional, 32.0));
+///     TextStyle::Button,
+///     (FontFamily::Proportional, 32.0)
+/// );
+///
+/// ctx.set_fonts(fonts);
+/// ```
+///
+/// You can also install your own custom fonts:
+/// ```
+/// # use {epaint::text::{FontDefinitions, TextStyle, FontFamily}};
+/// # struct FakeEguiCtx {};
+/// # impl FakeEguiCtx { fn set_fonts(&self, _: FontDefinitions) {} }
+/// # let ctx = FakeEguiCtx {};
+/// let mut fonts = FontDefinitions::default();
+///
+/// // Install my own font (maybe supporting non-latin characters):
+/// fonts.font_data.insert("my_font".to_owned(),
+///    std::borrow::Cow::Borrowed(include_bytes!("../../fonts/Ubuntu-Light.ttf"))); // .ttf and .otf supported
+///
+/// // Put my font first (highest priority):
+/// fonts.fonts_for_family.get_mut(&FontFamily::Proportional).unwrap()
+///     .insert(0, "my_font".to_owned());
+///
+/// // Put my font as last fallback for monospace:
+/// fonts.fonts_for_family.get_mut(&FontFamily::Monospace).unwrap()
+///     .push("my_font".to_owned());
+///
+/// ctx.set_fonts(fonts);
 /// ```
 #[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(feature = "persistence", derive(serde::Deserialize, serde::Serialize))]
-#[cfg_attr(feature = "persistence", serde(default))]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(default))]
 pub struct FontDefinitions {
     /// List of font names and their definitions.
     /// The definition must be the contents of either a `.ttf` or `.otf` font file.
     ///
     /// `epaint` has built-in-default for these,
     /// but you can override them if you like.
-    #[cfg_attr(feature = "persistence", serde(skip))]
     pub font_data: BTreeMap<String, FontData>,
 
     /// Which fonts (names) to use for each [`FontFamily`].
@@ -108,12 +137,9 @@ impl Default for FontDefinitions {
 
         #[cfg(feature = "default_fonts")]
         {
-            // TODO: figure out a way to make the WASM smaller despite including fonts. Zip them?
-
-            // Use size 13 for this. NOTHING ELSE:
             font_data.insert(
-                "ProggyClean".to_owned(),
-                std::borrow::Cow::Borrowed(include_bytes!("../../fonts/ProggyClean.ttf")),
+                "Hack".to_owned(),
+                std::borrow::Cow::Borrowed(include_bytes!("../../fonts/Hack-Regular.ttf")),
             );
             font_data.insert(
                 "Ubuntu-Light".to_owned(),
@@ -134,7 +160,7 @@ impl Default for FontDefinitions {
             fonts_for_family.insert(
                 FontFamily::Monospace,
                 vec![
-                    "ProggyClean".to_owned(),
+                    "Hack".to_owned(),
                     "Ubuntu-Light".to_owned(), // fallback for √ etc
                     "NotoEmoji-Regular".to_owned(),
                     "emoji-icon-font".to_owned(),
@@ -159,9 +185,9 @@ impl Default for FontDefinitions {
         let mut family_and_size = BTreeMap::new();
         family_and_size.insert(TextStyle::Small, (FontFamily::Proportional, 10.0));
         family_and_size.insert(TextStyle::Body, (FontFamily::Proportional, 14.0));
-        family_and_size.insert(TextStyle::Button, (FontFamily::Proportional, 16.0));
+        family_and_size.insert(TextStyle::Button, (FontFamily::Proportional, 14.0));
         family_and_size.insert(TextStyle::Heading, (FontFamily::Proportional, 20.0));
-        family_and_size.insert(TextStyle::Monospace, (FontFamily::Monospace, 13.0)); // 13 for `ProggyClean`
+        family_and_size.insert(TextStyle::Monospace, (FontFamily::Monospace, 14.0));
 
         Self {
             font_data,
@@ -172,6 +198,8 @@ impl Default for FontDefinitions {
 }
 
 /// The collection of fonts used by `epaint`.
+///
+/// Required in order to paint text.
 pub struct Fonts {
     pixels_per_point: f32,
     definitions: FontDefinitions,
@@ -180,10 +208,20 @@ pub struct Fonts {
     /// Copy of the texture in the texture atlas.
     /// This is so we can return a reference to it (the texture atlas is behind a lock).
     buffered_texture: Mutex<Arc<Texture>>,
+
+    galley_cache: Mutex<GalleyCache>,
 }
 
 impl Fonts {
-    pub fn from_definitions(pixels_per_point: f32, definitions: FontDefinitions) -> Self {
+    /// Create a new [`Fonts`] for text layout.
+    /// This call is expensive, so only create on [`Fonts`] and then reuse it.
+    pub fn new(pixels_per_point: f32, definitions: FontDefinitions) -> Self {
+        assert!(
+            0.0 < pixels_per_point && pixels_per_point < 100.0,
+            "pixels_per_point out of range: {}",
+            pixels_per_point
+        );
+
         // We want an atlas big enough to be able to include all the Emojis in the `TextStyle::Heading`,
         // so we can show the Emoji picker demo window.
         let mut atlas = TextureAtlas::new(2048, 64);
@@ -212,7 +250,7 @@ impl Fonts {
                     .map(|font_name| font_impl_cache.font_impl(font_name, scale_in_points))
                     .collect();
 
-                (text_style, Font::new(fonts))
+                (text_style, Font::new(text_style, fonts))
             })
             .collect();
 
@@ -220,10 +258,7 @@ impl Fonts {
             let mut atlas = atlas.lock();
             let texture = atlas.texture_mut();
             // Make sure we seed the texture version with something unique based on the default characters:
-            use std::collections::hash_map::DefaultHasher;
-            let mut hasher = DefaultHasher::default();
-            texture.pixels.hash(&mut hasher);
-            texture.version = hasher.finish();
+            texture.version = crate::util::hash(&texture.pixels);
         }
 
         Self {
@@ -232,15 +267,32 @@ impl Fonts {
             fonts,
             atlas,
             buffered_texture: Default::default(), //atlas.lock().texture().clone();
+            galley_cache: Default::default(),
         }
     }
 
+    #[deprecated = "Renamed to Fonts::new"]
+    pub fn from_definitions(pixels_per_point: f32, definitions: FontDefinitions) -> Self {
+        Self::new(pixels_per_point, definitions)
+    }
+
+    #[inline(always)]
     pub fn pixels_per_point(&self) -> f32 {
         self.pixels_per_point
     }
 
     pub fn definitions(&self) -> &FontDefinitions {
         &self.definitions
+    }
+
+    #[inline(always)]
+    pub fn round_to_pixel(&self, point: f32) -> f32 {
+        (point * self.pixels_per_point).round() / self.pixels_per_point
+    }
+
+    #[inline(always)]
+    pub fn floor_to_pixel(&self, point: f32) -> f32 {
+        (point * self.pixels_per_point).floor() / self.pixels_per_point
     }
 
     /// Call each frame to get the latest available font texture data.
@@ -253,13 +305,138 @@ impl Fonts {
 
         buffered_texture.clone()
     }
+
+    /// Width of this character in points.
+    pub fn glyph_width(&self, text_style: TextStyle, c: char) -> f32 {
+        self.fonts[&text_style].glyph_width(c)
+    }
+
+    /// Height of one row of text. In points
+    pub fn row_height(&self, text_style: TextStyle) -> f32 {
+        self.fonts[&text_style].row_height()
+    }
+
+    /// Layout some text.
+    /// This is the most advanced layout function.
+    /// See also [`Self::layout`], [`Self::layout_no_wrap`] and
+    /// [`Self::layout_delayed_color`].
+    ///
+    /// The implementation uses memoization so repeated calls are cheap.
+    pub fn layout_job(&self, job: LayoutJob) -> Arc<Galley> {
+        self.galley_cache.lock().layout(self, job)
+    }
+
+    /// Will wrap text at the given width and line break at `\n`.
+    ///
+    /// The implementation uses memoization so repeated calls are cheap.
+    pub fn layout(
+        &self,
+        text: String,
+        text_style: TextStyle,
+        color: crate::Color32,
+        wrap_width: f32,
+    ) -> Arc<Galley> {
+        let job = LayoutJob::simple(text, text_style, color, wrap_width);
+        self.layout_job(job)
+    }
+
+    /// Will line break at `\n`.
+    ///
+    /// The implementation uses memoization so repeated calls are cheap.
+    pub fn layout_no_wrap(
+        &self,
+        text: String,
+        text_style: TextStyle,
+        color: crate::Color32,
+    ) -> Arc<Galley> {
+        let job = LayoutJob::simple(text, text_style, color, f32::INFINITY);
+        self.layout_job(job)
+    }
+
+    /// Like [`Self::layout`], made for when you want to pick a color for the text later.
+    ///
+    /// The implementation uses memoization so repeated calls are cheap.
+    pub fn layout_delayed_color(
+        &self,
+        text: String,
+        text_style: TextStyle,
+        wrap_width: f32,
+    ) -> Arc<Galley> {
+        self.layout_job(LayoutJob::simple(
+            text,
+            text_style,
+            crate::Color32::TEMPORARY_COLOR,
+            wrap_width,
+        ))
+    }
+
+    pub fn num_galleys_in_cache(&self) -> usize {
+        self.galley_cache.lock().num_galleys_in_cache()
+    }
+
+    /// Must be called once per frame to clear the [`Galley`] cache.
+    pub fn end_frame(&self) {
+        self.galley_cache.lock().end_frame();
+    }
 }
 
 impl std::ops::Index<TextStyle> for Fonts {
     type Output = Font;
 
+    #[inline(always)]
     fn index(&self, text_style: TextStyle) -> &Font {
         &self.fonts[&text_style]
+    }
+}
+
+// ----------------------------------------------------------------------------
+
+struct CachedGalley {
+    /// When it was last used
+    last_used: u32,
+    galley: Arc<Galley>,
+}
+
+#[derive(Default)]
+struct GalleyCache {
+    /// Frame counter used to do garbage collection on the cache
+    generation: u32,
+    cache: nohash_hasher::IntMap<u64, CachedGalley>,
+}
+
+impl GalleyCache {
+    fn layout(&mut self, fonts: &Fonts, job: LayoutJob) -> Arc<Galley> {
+        let hash = crate::util::hash(&job); // TODO: even faster hasher?
+
+        match self.cache.entry(hash) {
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                let cached = entry.into_mut();
+                cached.last_used = self.generation;
+                cached.galley.clone()
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let galley = super::layout(fonts, job.into());
+                let galley = Arc::new(galley);
+                entry.insert(CachedGalley {
+                    last_used: self.generation,
+                    galley: galley.clone(),
+                });
+                galley
+            }
+        }
+    }
+
+    pub fn num_galleys_in_cache(&self) -> usize {
+        self.cache.len()
+    }
+
+    /// Must be called once per frame to clear the [`Galley`] cache.
+    pub fn end_frame(&mut self) {
+        let current_generation = self.generation;
+        self.cache.retain(|_key, cached| {
+            cached.last_used == current_generation // only keep those that were used this frame
+        });
+        self.generation = self.generation.wrapping_add(1);
     }
 }
 
@@ -268,7 +445,7 @@ impl std::ops::Index<TextStyle> for Fonts {
 struct FontImplCache {
     atlas: Arc<Mutex<TextureAtlas>>,
     pixels_per_point: f32,
-    rusttype_fonts: std::collections::BTreeMap<String, Arc<rusttype::Font<'static>>>,
+    ab_glyph_fonts: BTreeMap<String, ab_glyph::FontArc>,
 
     /// Map font names and size to the cached `FontImpl`.
     /// Can't have f32 in a HashMap or BTreeMap, so let's do a linear search
@@ -281,27 +458,22 @@ impl FontImplCache {
         pixels_per_point: f32,
         definitions: &super::FontDefinitions,
     ) -> Self {
-        let rusttype_fonts = definitions
+        let ab_glyph_fonts = definitions
             .font_data
             .iter()
-            .map(|(name, font_data)| {
-                (
-                    name.clone(),
-                    Arc::new(rusttype_font_from_font_data(name, font_data)),
-                )
-            })
+            .map(|(name, font_data)| (name.clone(), ab_glyph_font_from_font_data(name, font_data)))
             .collect();
 
         Self {
             atlas,
             pixels_per_point,
-            rusttype_fonts,
+            ab_glyph_fonts,
             cache: Default::default(),
         }
     }
 
-    pub fn rusttype_font(&self, font_name: &str) -> Arc<rusttype::Font<'static>> {
-        self.rusttype_fonts
+    pub fn ab_glyph_font(&self, font_name: &str) -> ab_glyph::FontArc {
+        self.ab_glyph_fonts
             .get(font_name)
             .unwrap_or_else(|| panic!("No font data found for {:?}", font_name))
             .clone()
@@ -330,7 +502,7 @@ impl FontImplCache {
         let font_impl = Arc::new(FontImpl::new(
             self.atlas.clone(),
             self.pixels_per_point,
-            self.rusttype_font(font_name),
+            self.ab_glyph_font(font_name),
             scale_in_points,
             y_offset,
         ));

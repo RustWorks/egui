@@ -5,6 +5,7 @@ use epaint::*;
 
 /// Color and margin of a rectangular background of a [`Ui`].
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[must_use = "You should call .show()"]
 pub struct Frame {
     /// On each side
     pub margin: Vec2,
@@ -22,9 +23,9 @@ impl Frame {
     /// For when you want to group a few widgets together within a frame.
     pub fn group(style: &Style) -> Self {
         Self {
-            margin: Vec2::new(8.0, 6.0),
-            corner_radius: 4.0,
-            stroke: style.visuals.window_stroke(),
+            margin: Vec2::splat(6.0), // symmetric looks best in corners when nesting
+            corner_radius: style.visuals.widgets.noninteractive.corner_radius,
+            stroke: style.visuals.widgets.noninteractive.bg_stroke,
             ..Default::default()
         }
     }
@@ -62,8 +63,8 @@ impl Frame {
     pub fn menu(style: &Style) -> Self {
         Self {
             margin: Vec2::splat(1.0),
-            corner_radius: 2.0,
-            shadow: Shadow::small(),
+            corner_radius: style.visuals.widgets.noninteractive.corner_radius,
+            shadow: style.visuals.popup_shadow,
             fill: style.visuals.window_fill(),
             stroke: style.visuals.window_stroke(),
         }
@@ -72,8 +73,8 @@ impl Frame {
     pub fn popup(style: &Style) -> Self {
         Self {
             margin: style.spacing.window_padding,
-            corner_radius: 5.0,
-            shadow: Shadow::small(),
+            corner_radius: style.visuals.widgets.noninteractive.corner_radius,
+            shadow: style.visuals.popup_shadow,
             fill: style.visuals.window_fill(),
             stroke: style.visuals.window_stroke(),
         }
@@ -83,7 +84,7 @@ impl Frame {
     pub fn dark_canvas(style: &Style) -> Self {
         Self {
             margin: Vec2::new(10.0, 10.0),
-            corner_radius: 5.0,
+            corner_radius: style.visuals.widgets.noninteractive.corner_radius,
             fill: Color32::from_black_alpha(250),
             stroke: style.visuals.window_stroke(),
             ..Default::default()
@@ -102,6 +103,22 @@ impl Frame {
         self
     }
 
+    pub fn corner_radius(mut self, corner_radius: f32) -> Self {
+        self.corner_radius = corner_radius;
+        self
+    }
+
+    /// Margin on each side of the frame.
+    pub fn margin(mut self, margin: impl Into<Vec2>) -> Self {
+        self.margin = margin.into();
+        self
+    }
+
+    pub fn shadow(mut self, shadow: Shadow) -> Self {
+        self.shadow = shadow;
+        self
+    }
+
     pub fn multiply_with_opacity(mut self, opacity: f32) -> Self {
         self.fill = self.fill.linear_multiply(opacity);
         self.stroke.color = self.stroke.color.linear_multiply(opacity);
@@ -112,7 +129,6 @@ impl Frame {
 
 pub struct Prepared {
     pub frame: Frame,
-    outer_rect_bounds: Rect,
     where_to_put_background: ShapeIdx,
     pub content_ui: Ui,
 }
@@ -121,24 +137,36 @@ impl Frame {
     pub fn begin(self, ui: &mut Ui) -> Prepared {
         let where_to_put_background = ui.painter().add(Shape::Noop);
         let outer_rect_bounds = ui.available_rect_before_wrap();
-        let inner_rect = outer_rect_bounds.shrink2(self.margin);
+        let mut inner_rect = outer_rect_bounds.shrink2(self.margin);
+
+        // Make sure we don't shrink to the negative:
+        inner_rect.max.x = inner_rect.max.x.max(inner_rect.min.x);
+        inner_rect.max.y = inner_rect.max.y.max(inner_rect.min.y);
+
         let content_ui = ui.child_ui(inner_rect, *ui.layout());
 
         // content_ui.set_clip_rect(outer_rect_bounds.shrink(self.stroke.width * 0.5)); // Can't do this since we don't know final size yet
 
         Prepared {
             frame: self,
-            outer_rect_bounds,
             where_to_put_background,
             content_ui,
         }
     }
 
-    pub fn show<R>(self, ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
+    pub fn show<R>(self, ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R> {
+        self.show_dyn(ui, Box::new(add_contents))
+    }
+
+    fn show_dyn<'c, R>(
+        self,
+        ui: &mut Ui,
+        add_contents: Box<dyn FnOnce(&mut Ui) -> R + 'c>,
+    ) -> InnerResponse<R> {
         let mut prepared = self.begin(ui);
         let ret = add_contents(&mut prepared.content_ui);
-        prepared.end(ui);
-        ret
+        let response = prepared.end(ui);
+        InnerResponse::new(ret, response)
     }
 
     pub fn paint(&self, outer_rect: Rect) -> Shape {
@@ -150,12 +178,12 @@ impl Frame {
             stroke,
         } = *self;
 
-        let frame_shape = Shape::Rect {
+        let frame_shape = Shape::Rect(epaint::RectShape {
             rect: outer_rect,
             corner_radius,
             fill,
             stroke,
-        };
+        });
 
         if shadow == Default::default() {
             frame_shape
@@ -169,13 +197,10 @@ impl Frame {
 
 impl Prepared {
     pub fn outer_rect(&self) -> Rect {
-        Rect::from_min_max(
-            self.outer_rect_bounds.min,
-            self.content_ui.min_rect().max + self.frame.margin,
-        )
+        self.content_ui.min_rect().expand2(self.frame.margin)
     }
 
-    pub fn end(self, ui: &mut Ui) -> Rect {
+    pub fn end(self, ui: &mut Ui) -> Response {
         let outer_rect = self.outer_rect();
 
         let Prepared {
@@ -186,7 +211,6 @@ impl Prepared {
 
         let shape = frame.paint(outer_rect);
         ui.painter().set(where_to_put_background, shape);
-        ui.advance_cursor_after_rect(outer_rect);
-        outer_rect
+        ui.allocate_rect(outer_rect, Sense::hover())
     }
 }

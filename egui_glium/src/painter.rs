@@ -1,8 +1,9 @@
 #![allow(deprecated)] // legacy implement_vertex macro
+#![allow(semicolon_in_expressions_from_macros)] // glium::program! macro
 
 use {
     egui::{
-        emath::{clamp, Rect},
+        emath::Rect,
         epaint::{Color32, Mesh},
     },
     glium::{
@@ -12,8 +13,8 @@ use {
         texture::{self, srgb_texture2d::SrgbTexture2d},
         uniform,
         uniforms::{MagnifySamplerFilter, SamplerWrapFunction},
-        Frame, Surface,
     },
+    std::rc::Rc,
 };
 
 pub struct Painter {
@@ -31,8 +32,9 @@ struct UserTexture {
     /// This is the format glium likes.
     pixels: Vec<Vec<(u8, u8, u8, u8)>>,
 
-    /// Lazily uploaded
-    gl_texture: Option<SrgbTexture2d>,
+    /// Lazily uploaded from [`Self::pixels`],
+    /// or owned by the user via `register_native_texture`.
+    gl_texture: Option<Rc<SrgbTexture2d>>,
 }
 
 impl Painter {
@@ -92,36 +94,29 @@ impl Painter {
         self.egui_texture_version = Some(texture.version);
     }
 
-    /// Main entry-point for painting a frame
-    pub fn paint_meshes(
+    /// Main entry-point for painting a frame.
+    /// You should call `target.clear_color(..)` before
+    /// and `target.finish()` after this.
+    pub fn paint_meshes<T: glium::Surface>(
         &mut self,
         display: &glium::Display,
+        target: &mut T,
         pixels_per_point: f32,
-        clear_color: egui::Rgba,
         cipped_meshes: Vec<egui::ClippedMesh>,
         egui_texture: &egui::Texture,
     ) {
         self.upload_egui_texture(display, egui_texture);
         self.upload_pending_user_textures(display);
 
-        let mut target = display.draw();
-        // Verified to be gamma-correct.
-        target.clear_color(
-            clear_color[0],
-            clear_color[1],
-            clear_color[2],
-            clear_color[3],
-        );
         for egui::ClippedMesh(clip_rect, mesh) in cipped_meshes {
-            self.paint_mesh(&mut target, display, pixels_per_point, clip_rect, &mesh)
+            self.paint_mesh(target, display, pixels_per_point, clip_rect, &mesh);
         }
-        target.finish().unwrap();
     }
 
     #[inline(never)] // Easier profiling
-    pub fn paint_mesh(
+    pub fn paint_mesh<T: glium::Surface>(
         &mut self,
-        target: &mut Frame,
+        target: &mut T,
         display: &glium::Display,
         pixels_per_point: f32,
         clip_rect: Rect,
@@ -152,11 +147,9 @@ impl Painter {
             glium::VertexBuffer::new(display, &vertices).unwrap()
         };
 
-        let indices: Vec<u32> = mesh.indices.iter().map(|idx| *idx as u32).collect();
-
         // TODO: we should probably reuse the `IndexBuffer` instead of allocating a new one each frame.
         let index_buffer =
-            glium::IndexBuffer::new(display, PrimitiveType::TrianglesList, &indices).unwrap();
+            glium::IndexBuffer::new(display, PrimitiveType::TrianglesList, &mesh.indices).unwrap();
 
         let (width_in_pixels, height_in_pixels) = display.get_framebuffer_dimensions();
         let width_in_points = width_in_pixels as f32 / pixels_per_point;
@@ -201,10 +194,10 @@ impl Painter {
             let clip_max_y = pixels_per_point * clip_rect.max.y;
 
             // Make sure clip rect can fit within a `u32`:
-            let clip_min_x = clamp(clip_min_x, 0.0..=width_in_pixels as f32);
-            let clip_min_y = clamp(clip_min_y, 0.0..=height_in_pixels as f32);
-            let clip_max_x = clamp(clip_max_x, clip_min_x..=width_in_pixels as f32);
-            let clip_max_y = clamp(clip_max_y, clip_min_y..=height_in_pixels as f32);
+            let clip_min_x = clip_min_x.clamp(0.0, width_in_pixels as f32);
+            let clip_min_y = clip_min_y.clamp(0.0, height_in_pixels as f32);
+            let clip_max_x = clip_max_x.clamp(clip_min_x, width_in_pixels as f32);
+            let clip_max_y = clip_max_y.clamp(clip_min_y, height_in_pixels as f32);
 
             let clip_min_x = clip_min_x.round() as u32;
             let clip_min_y = clip_min_y.round() as u32;
@@ -250,30 +243,25 @@ impl Painter {
         self.user_textures.push(Some(Default::default()));
         id
     }
-    /// register glium texture as egui texture
-    /// Usable for render to image rectangle
-    pub fn register_glium_texture(
-        &mut self,
-        texture: glium::texture::SrgbTexture2d,
-    ) -> egui::TextureId {
-        let id = self.alloc_user_texture();
-        if let egui::TextureId::User(id) = id {
-            if let Some(Some(user_texture)) = self.user_textures.get_mut(id as usize) {
-                *user_texture = UserTexture {
-                    pixels: vec![],
-                    gl_texture: Some(texture),
-                }
-            }
-        }
-        id
+
+    #[cfg(feature = "epi")]
+    #[deprecated = "Use: `NativeTexture::register_native_texture` instead"]
+    pub fn register_glium_texture(&mut self, texture: Rc<SrgbTexture2d>) -> egui::TextureId {
+        use epi::NativeTexture as _;
+        self.register_native_texture(texture)
     }
+
     pub fn set_user_texture(
         &mut self,
         id: egui::TextureId,
         size: (usize, usize),
         pixels: &[Color32],
     ) {
-        assert_eq!(size.0 * size.1, pixels.len());
+        assert_eq!(
+            size.0 * size.1,
+            pixels.len(),
+            "Mismatch between texture size and texel count"
+        );
 
         if let egui::TextureId::User(id) = id {
             if let Some(Some(user_texture)) = self.user_textures.get_mut(id as usize) {
@@ -307,20 +295,51 @@ impl Painter {
                 .get(id as usize)?
                 .as_ref()?
                 .gl_texture
-                .as_ref(),
+                .as_ref()
+                .map(|rc| rc.as_ref()),
         }
     }
 
     pub fn upload_pending_user_textures(&mut self, facade: &dyn glium::backend::Facade) {
-        for user_texture in &mut self.user_textures {
-            if let Some(user_texture) = user_texture {
-                if user_texture.gl_texture.is_none() {
-                    let pixels = std::mem::take(&mut user_texture.pixels);
-                    let format = texture::SrgbFormat::U8U8U8U8;
-                    let mipmaps = texture::MipmapsOption::NoMipmap;
-                    user_texture.gl_texture =
-                        Some(SrgbTexture2d::with_format(facade, pixels, format, mipmaps).unwrap());
+        for user_texture in self.user_textures.iter_mut().flatten() {
+            if user_texture.gl_texture.is_none() {
+                let pixels = std::mem::take(&mut user_texture.pixels);
+                let format = texture::SrgbFormat::U8U8U8U8;
+                let mipmaps = texture::MipmapsOption::NoMipmap;
+                user_texture.gl_texture = Some(
+                    SrgbTexture2d::with_format(facade, pixels, format, mipmaps)
+                        .unwrap()
+                        .into(),
+                );
+            }
+        }
+    }
+}
+
+#[cfg(feature = "epi")]
+impl epi::NativeTexture for Painter {
+    type Texture = Rc<SrgbTexture2d>;
+
+    fn register_native_texture(&mut self, native: Self::Texture) -> egui::TextureId {
+        let id = self.alloc_user_texture();
+        if let egui::TextureId::User(id) = id {
+            if let Some(Some(user_texture)) = self.user_textures.get_mut(id as usize) {
+                *user_texture = UserTexture {
+                    pixels: vec![],
+                    gl_texture: Some(native),
                 }
+            }
+        }
+        id
+    }
+
+    fn replace_native_texture(&mut self, id: egui::TextureId, replacing: Self::Texture) {
+        if let egui::TextureId::User(id) = id {
+            if let Some(Some(user_texture)) = self.user_textures.get_mut(id as usize) {
+                *user_texture = UserTexture {
+                    pixels: vec![],
+                    gl_texture: Some(replacing),
+                };
             }
         }
     }

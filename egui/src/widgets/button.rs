@@ -1,38 +1,60 @@
 use crate::*;
 
+/// For those of us who miss `a ? yes : no`.
+fn select<T>(b: bool, if_true: T, if_false: T) -> T {
+    if b {
+        if_true
+    } else {
+        if_false
+    }
+}
+
 /// Clickable button with text.
 ///
 /// See also [`Ui::button`].
 ///
 /// ```
 /// # let ui = &mut egui::Ui::__test();
+/// # fn do_stuff() {}
+///
 /// if ui.add(egui::Button::new("Click mew")).clicked() {
 ///     do_stuff();
 /// }
-/// # fn do_stuff() {}
+///
+/// // A greyed-out and non-interactive button:
+/// if ui.add_enabled(false, egui::Button::new("Can't click this")).clicked() {
+///     unreachable!();
+/// }
 /// ```
 #[must_use = "You should put this widget in an ui with `ui.add(widget);`"]
 pub struct Button {
     text: String,
     text_color: Option<Color32>,
-    text_style: TextStyle,
+    text_style: Option<TextStyle>,
     /// None means default for interact
     fill: Option<Color32>,
+    stroke: Option<Stroke>,
     sense: Sense,
     small: bool,
-    frame: bool,
+    frame: Option<bool>,
+    wrap: Option<bool>,
+    min_size: Vec2,
 }
 
 impl Button {
-    pub fn new(text: impl Into<String>) -> Self {
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn new(text: impl ToString) -> Self {
         Self {
-            text: text.into(),
+            text: text.to_string(),
             text_color: None,
-            text_style: TextStyle::Button,
-            fill: Default::default(),
+            text_style: None,
+            fill: None,
+            stroke: None,
             sense: Sense::click(),
             small: false,
-            frame: true,
+            frame: None,
+            wrap: None,
+            min_size: Vec2::ZERO,
         }
     }
 
@@ -47,25 +69,36 @@ impl Button {
     }
 
     pub fn text_style(mut self, text_style: TextStyle) -> Self {
-        self.text_style = text_style;
+        self.text_style = Some(text_style);
         self
     }
 
-    pub fn fill(mut self, fill: Option<Color32>) -> Self {
-        self.fill = fill;
+    /// Override background fill color. Note that this will override any on-hover effects.
+    /// Calling this will also turn on the frame.
+    pub fn fill(mut self, fill: impl Into<Color32>) -> Self {
+        self.fill = Some(fill.into());
+        self.frame = Some(true);
+        self
+    }
+
+    /// Override button stroke. Note that this will override any on-hover effects.
+    /// Calling this will also turn on the frame.
+    pub fn stroke(mut self, stroke: impl Into<Stroke>) -> Self {
+        self.stroke = Some(stroke.into());
+        self.frame = Some(true);
         self
     }
 
     /// Make this a small button, suitable for embedding into text.
     pub fn small(mut self) -> Self {
-        self.text_style = TextStyle::Body;
+        self.text_style = Some(TextStyle::Body);
         self.small = true;
         self
     }
 
     /// Turn off the frame
     pub fn frame(mut self, frame: bool) -> Self {
-        self.frame = frame;
+        self.frame = Some(frame);
         self
     }
 
@@ -76,29 +109,43 @@ impl Button {
         self
     }
 
-    /// If you set this to `false`, the button will be grayed out and un-clickable.
-    /// `enabled(false)` has the same effect as calling `sense(Sense::hover())`.
+    /// If `true`, the text will wrap at the `max_width`.
+    /// By default [`Self::wrap`] will be true in vertical layouts
+    /// and horizontal layouts with wrapping,
+    /// and false on non-wrapping horizontal layouts.
     ///
-    /// This is a convenience for [`Ui::set_enabled`].
-    pub fn enabled(mut self, enabled: bool) -> Self {
-        if !enabled {
-            self.sense = Sense::hover();
-        }
+    /// Note that any `\n` in the button text will always produce a new line.
+    pub fn wrap(mut self, wrap: bool) -> Self {
+        self.wrap = Some(wrap);
+        self
+    }
+
+    pub(crate) fn min_size(mut self, min_size: Vec2) -> Self {
+        self.min_size = min_size;
         self
     }
 }
 
-impl Button {
-    fn enabled_ui(self, ui: &mut Ui) -> Response {
+impl Widget for Button {
+    fn ui(self, ui: &mut Ui) -> Response {
         let Button {
             text,
             text_color,
             text_style,
             fill,
+            stroke,
             sense,
             small,
             frame,
+            wrap,
+            min_size,
         } = self;
+
+        let frame = frame.unwrap_or_else(|| ui.visuals().button_frame);
+
+        let text_style = text_style
+            .or(ui.style().override_text_style)
+            .unwrap_or(TextStyle::Button);
 
         let mut button_padding = ui.spacing().button_padding;
         if small {
@@ -106,62 +153,46 @@ impl Button {
         }
         let total_extra = button_padding + button_padding;
 
-        let font = &ui.fonts()[text_style];
-        let galley = if ui.wrap_text() {
-            font.layout_multiline(text, ui.available_width() - total_extra.x)
-        } else {
-            font.layout_no_wrap(text)
-        };
+        let wrap = wrap.unwrap_or_else(|| ui.wrap_text());
+        let wrap_width = select(wrap, ui.available_width() - total_extra.x, f32::INFINITY);
+        let galley = ui
+            .fonts()
+            .layout_delayed_color(text, text_style, wrap_width);
 
-        let mut desired_size = galley.size + 2.0 * button_padding;
+        let mut desired_size = galley.size() + 2.0 * button_padding;
         if !small {
             desired_size.y = desired_size.y.at_least(ui.spacing().interact_size.y);
         }
+        desired_size = desired_size.at_least(min_size);
 
         let (rect, response) = ui.allocate_at_least(desired_size, sense);
-        response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, &galley.text));
+        response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, galley.text()));
 
         if ui.clip_rect().intersects(rect) {
             let visuals = ui.style().interact(&response);
-            let text_cursor = ui
+            let text_pos = ui
                 .layout()
-                .align_size_within_rect(galley.size, rect.shrink2(button_padding))
+                .align_size_within_rect(galley.size(), rect.shrink2(button_padding))
                 .min;
 
             if frame {
                 let fill = fill.unwrap_or(visuals.bg_fill);
+                let stroke = stroke.unwrap_or(visuals.bg_stroke);
                 ui.painter().rect(
                     rect.expand(visuals.expansion),
                     visuals.corner_radius,
                     fill,
-                    visuals.bg_stroke,
+                    stroke,
                 );
             }
 
             let text_color = text_color
                 .or(ui.visuals().override_text_color)
                 .unwrap_or_else(|| visuals.text_color());
-            ui.painter()
-                .galley(text_cursor, galley, text_style, text_color);
+            ui.painter().galley_with_color(text_pos, galley, text_color);
         }
 
         response
-    }
-}
-
-impl Widget for Button {
-    fn ui(self, ui: &mut Ui) -> Response {
-        let button_enabled = self.sense != Sense::hover();
-        if button_enabled || !ui.enabled() {
-            self.enabled_ui(ui)
-        } else {
-            // We need get a temporary disabled `Ui` to get that grayed out look:
-            ui.wrap(|ui| {
-                ui.set_enabled(false);
-                self.enabled_ui(ui)
-            })
-            .inner
-        }
     }
 }
 
@@ -185,19 +216,27 @@ pub struct Checkbox<'a> {
     checked: &'a mut bool,
     text: String,
     text_color: Option<Color32>,
+    text_style: Option<TextStyle>,
 }
 
 impl<'a> Checkbox<'a> {
-    pub fn new(checked: &'a mut bool, text: impl Into<String>) -> Self {
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn new(checked: &'a mut bool, text: impl ToString) -> Self {
         Checkbox {
             checked,
-            text: text.into(),
+            text: text.to_string(),
             text_color: None,
+            text_style: None,
         }
     }
 
     pub fn text_color(mut self, text_color: Color32) -> Self {
         self.text_color = Some(text_color);
+        self
+    }
+
+    pub fn text_style(mut self, text_style: TextStyle) -> Self {
+        self.text_style = Some(text_style);
         self
     }
 }
@@ -208,10 +247,12 @@ impl<'a> Widget for Checkbox<'a> {
             checked,
             text,
             text_color,
+            text_style,
         } = self;
 
-        let text_style = TextStyle::Button;
-        let font = &ui.fonts()[text_style];
+        let text_style = text_style
+            .or(ui.style().override_text_style)
+            .unwrap_or(TextStyle::Button);
 
         let spacing = &ui.spacing();
         let icon_width = spacing.icon_width;
@@ -219,13 +260,16 @@ impl<'a> Widget for Checkbox<'a> {
         let button_padding = spacing.button_padding;
         let total_extra = button_padding + vec2(icon_width + icon_spacing, 0.0) + button_padding;
 
-        let galley = if ui.wrap_text() {
-            font.layout_multiline(text, ui.available_width() - total_extra.x)
-        } else {
-            font.layout_no_wrap(text)
-        };
+        let wrap_width = select(
+            ui.wrap_text(),
+            ui.available_width() - total_extra.x,
+            f32::INFINITY,
+        );
+        let galley = ui
+            .fonts()
+            .layout_delayed_color(text, text_style, wrap_width);
 
-        let mut desired_size = total_extra + galley.size;
+        let mut desired_size = total_extra + galley.size();
         desired_size = desired_size.at_least(spacing.interact_size);
         desired_size.y = desired_size.y.max(icon_width);
         let (rect, mut response) = ui.allocate_exact_size(desired_size, Sense::click());
@@ -234,16 +278,17 @@ impl<'a> Widget for Checkbox<'a> {
             *checked = !*checked;
             response.mark_changed();
         }
-        response.widget_info(|| WidgetInfo::selected(WidgetType::Checkbox, *checked, &galley.text));
+        response
+            .widget_info(|| WidgetInfo::selected(WidgetType::Checkbox, *checked, galley.text()));
 
         // let visuals = ui.style().interact_selectable(&response, *checked); // too colorful
         let visuals = ui.style().interact(&response);
-        let text_cursor = pos2(
+        let text_pos = pos2(
             rect.min.x + button_padding.x + icon_width + icon_spacing,
-            rect.center().y - 0.5 * galley.size.y,
+            rect.center().y - 0.5 * galley.size().y,
         );
         let (small_icon_rect, big_icon_rect) = ui.spacing().icon_rectangles(rect);
-        ui.painter().add(Shape::Rect {
+        ui.painter().add(epaint::RectShape {
             rect: big_icon_rect.expand(visuals.expansion),
             corner_radius: visuals.corner_radius,
             fill: visuals.bg_fill,
@@ -265,8 +310,7 @@ impl<'a> Widget for Checkbox<'a> {
         let text_color = text_color
             .or(ui.visuals().override_text_color)
             .unwrap_or_else(|| visuals.text_color());
-        ui.painter()
-            .galley(text_cursor, galley, text_style, text_color);
+        ui.painter().galley_with_color(text_pos, galley, text_color);
         response
     }
 }
@@ -297,19 +341,27 @@ pub struct RadioButton {
     checked: bool,
     text: String,
     text_color: Option<Color32>,
+    text_style: Option<TextStyle>,
 }
 
 impl RadioButton {
-    pub fn new(checked: bool, text: impl Into<String>) -> Self {
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn new(checked: bool, text: impl ToString) -> Self {
         Self {
             checked,
-            text: text.into(),
+            text: text.to_string(),
             text_color: None,
+            text_style: None,
         }
     }
 
     pub fn text_color(mut self, text_color: Color32) -> Self {
         self.text_color = Some(text_color);
+        self
+    }
+
+    pub fn text_style(mut self, text_style: TextStyle) -> Self {
+        self.text_style = Some(text_style);
         self
     }
 }
@@ -320,32 +372,37 @@ impl Widget for RadioButton {
             checked,
             text,
             text_color,
+            text_style,
         } = self;
 
-        let text_style = TextStyle::Button;
-        let font = &ui.fonts()[text_style];
+        let text_style = text_style
+            .or(ui.style().override_text_style)
+            .unwrap_or(TextStyle::Button);
 
         let icon_width = ui.spacing().icon_width;
         let icon_spacing = ui.spacing().icon_spacing;
         let button_padding = ui.spacing().button_padding;
         let total_extra = button_padding + vec2(icon_width + icon_spacing, 0.0) + button_padding;
 
-        let galley = if ui.wrap_text() {
-            font.layout_multiline(text, ui.available_width() - total_extra.x)
-        } else {
-            font.layout_no_wrap(text)
-        };
+        let wrap_width = select(
+            ui.wrap_text(),
+            ui.available_width() - total_extra.x,
+            f32::INFINITY,
+        );
+        let galley = ui
+            .fonts()
+            .layout_delayed_color(text, text_style, wrap_width);
 
-        let mut desired_size = total_extra + galley.size;
+        let mut desired_size = total_extra + galley.size();
         desired_size = desired_size.at_least(ui.spacing().interact_size);
         desired_size.y = desired_size.y.max(icon_width);
         let (rect, response) = ui.allocate_exact_size(desired_size, Sense::click());
         response
-            .widget_info(|| WidgetInfo::selected(WidgetType::RadioButton, checked, &galley.text));
+            .widget_info(|| WidgetInfo::selected(WidgetType::RadioButton, checked, galley.text()));
 
-        let text_cursor = pos2(
+        let text_pos = pos2(
             rect.min.x + button_padding.x + icon_width + icon_spacing,
-            rect.center().y - 0.5 * galley.size.y,
+            rect.center().y - 0.5 * galley.size().y,
         );
 
         // let visuals = ui.style().interact_selectable(&response, checked); // too colorful
@@ -355,7 +412,7 @@ impl Widget for RadioButton {
 
         let painter = ui.painter();
 
-        painter.add(Shape::Circle {
+        painter.add(epaint::CircleShape {
             center: big_icon_rect.center(),
             radius: big_icon_rect.width() / 2.0 + visuals.expansion,
             fill: visuals.bg_fill,
@@ -363,7 +420,7 @@ impl Widget for RadioButton {
         });
 
         if checked {
-            painter.add(Shape::Circle {
+            painter.add(epaint::CircleShape {
                 center: small_icon_rect.center(),
                 radius: small_icon_rect.width() / 3.0,
                 fill: visuals.fg_stroke.color, // Intentional to use stroke and not fill
@@ -375,7 +432,7 @@ impl Widget for RadioButton {
         let text_color = text_color
             .or(ui.visuals().override_text_color)
             .unwrap_or_else(|| visuals.text_color());
-        painter.galley(text_cursor, galley, text_style, text_color);
+        painter.galley_with_color(text_pos, galley, text_color);
         response
     }
 }
@@ -443,31 +500,50 @@ impl Widget for ImageButton {
             selected,
         } = self;
 
-        let button_padding = ui.spacing().button_padding;
-        let size = image.size() + 2.0 * button_padding;
-        let (rect, response) = ui.allocate_exact_size(size, sense);
+        let padding = if frame {
+            // so we can see that it is a button:
+            Vec2::splat(ui.spacing().button_padding.x)
+        } else {
+            Vec2::ZERO
+        };
+        let padded_size = image.size() + 2.0 * padding;
+        let (rect, response) = ui.allocate_exact_size(padded_size, sense);
         response.widget_info(|| WidgetInfo::new(WidgetType::ImageButton));
 
         if ui.clip_rect().intersects(rect) {
-            let visuals = ui.style().interact(&response);
-
-            if selected {
+            let (expansion, corner_radius, fill, stroke) = if selected {
                 let selection = ui.visuals().selection;
-                ui.painter()
-                    .rect(rect, 0.0, selection.bg_fill, selection.stroke);
+                (-padding, 0.0, selection.bg_fill, selection.stroke)
             } else if frame {
-                ui.painter().rect(
-                    rect.expand(visuals.expansion),
+                let visuals = ui.style().interact(&response);
+                let expansion = if response.hovered {
+                    Vec2::splat(visuals.expansion) - padding
+                } else {
+                    Vec2::splat(visuals.expansion)
+                };
+                (
+                    expansion,
                     visuals.corner_radius,
                     visuals.bg_fill,
                     visuals.bg_stroke,
-                );
-            }
+                )
+            } else {
+                Default::default()
+            };
+
+            // Draw frame background (for transparent images):
+            ui.painter()
+                .rect_filled(rect.expand2(expansion), corner_radius, fill);
 
             let image_rect = ui
                 .layout()
-                .align_size_within_rect(image.size(), rect.shrink2(button_padding));
+                .align_size_within_rect(image.size(), rect.shrink2(padding));
+            // let image_rect = image_rect.expand2(expansion); // can make it blurry, so let's not
             image.paint_at(ui, image_rect);
+
+            // Draw frame outline:
+            ui.painter()
+                .rect_stroke(rect.expand2(expansion), corner_radius, stroke);
         }
 
         response

@@ -17,8 +17,9 @@ jobs:
       - uses: actions-rs/toolchain@v1
         with:
           profile: minimal
-          toolchain: stable
+          toolchain: 1.54.0
           override: true
+      - run: sudo apt-get update && sudo apt-get install libspeechd-dev
       - uses: actions-rs/cargo@v1
         with:
           command: check
@@ -31,9 +32,9 @@ jobs:
       - uses: actions-rs/toolchain@v1
         with:
           profile: minimal
-          toolchain: stable
+          toolchain: 1.54.0
           override: true
-      - run: sudo apt-get install libspeechd-dev
+      - run: sudo apt-get update && sudo apt-get install libspeechd-dev
       - uses: actions-rs/cargo@v1
         with:
           command: check
@@ -47,7 +48,7 @@ jobs:
       - uses: actions-rs/toolchain@v1
         with:
           profile: minimal
-          toolchain: stable
+          toolchain: 1.54.0
           override: true
       - run: rustup target add wasm32-unknown-unknown
       - uses: actions-rs/cargo@v1
@@ -63,7 +64,7 @@ jobs:
       - uses: actions-rs/toolchain@v1
         with:
           profile: minimal
-          toolchain: stable
+          toolchain: 1.54.0
           override: true
       - run: rustup target add wasm32-unknown-unknown
       - uses: actions-rs/cargo@v1
@@ -79,9 +80,9 @@ jobs:
       - uses: actions-rs/toolchain@v1
         with:
           profile: minimal
-          toolchain: stable
+          toolchain: 1.54.0
           override: true
-      - run: sudo apt-get install libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libspeechd-dev
+      - run: sudo apt-get update && sudo apt-get install libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libspeechd-dev libxkbcommon-dev libssl-dev libgtk-3-dev # libgtk-3-dev is used by rfd
       - uses: actions-rs/cargo@v1
         with:
           command: test
@@ -95,7 +96,7 @@ jobs:
       - uses: actions-rs/toolchain@v1
         with:
           profile: minimal
-          toolchain: stable
+          toolchain: 1.54.0
           override: true
       - run: rustup component add rustfmt
       - uses: actions-rs/cargo@v1
@@ -111,10 +112,38 @@ jobs:
       - uses: actions-rs/toolchain@v1
         with:
           profile: minimal
-          toolchain: stable
+          toolchain: 1.54.0
           override: true
       - run: rustup component add clippy
+      - run: sudo apt-get update && sudo apt-get install libspeechd-dev libgtk-3-dev # libgtk-3-dev is used by rfd
       - uses: actions-rs/cargo@v1
         with:
           command: clippy
-          args: -- -D warnings
+          args: --workspace --all-targets --all-features --  -D warnings -W clippy::all
+
+  doc:
+    name: cargo doc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: 1.54.0
+          override: true
+      - run: sudo apt-get update && sudo apt-get install libspeechd-dev
+      - run: cargo doc -p emath -p epaint -p egui -p eframe -p epi -p egui_web -p egui-winit -p egui_glium -p egui_glow --lib --no-deps --all-features
+
+  doc_web:
+    name: cargo doc web
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: 1.54.0
+          override: true
+      - run: sudo apt-get update && sudo apt-get install libspeechd-dev
+      - run: rustup target add wasm32-unknown-unknown
+      - run: cargo doc -p egui_web --target wasm32-unknown-unknown --lib --no-deps --all-features

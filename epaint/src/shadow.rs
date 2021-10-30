@@ -3,7 +3,7 @@ use super::*;
 /// The color and fuzziness of a fuzzy shape.
 /// Can be used for a rectangular shadow with a soft penumbra.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-#[cfg_attr(feature = "persistence", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct Shadow {
     /// The shadow extends this much outside the rect.
     /// The size of the fuzzy penumbra.
@@ -14,11 +14,19 @@ pub struct Shadow {
 }
 
 impl Shadow {
-    /// Tooltips, menus, ...
-    pub fn small() -> Self {
+    /// Tooltips, menus, …
+    pub fn small_dark() -> Self {
         Self {
-            extrusion: 8.0,
-            color: Color32::from_black_alpha(64),
+            extrusion: 16.0,
+            color: Color32::from_black_alpha(96),
+        }
+    }
+
+    /// Tooltips, menus, …
+    pub fn small_light() -> Self {
+        Self {
+            extrusion: 16.0,
+            color: Color32::from_black_alpha(32),
         }
     }
 
@@ -44,12 +52,11 @@ impl Shadow {
         let Self { extrusion, color } = *self;
 
         use crate::tessellator::*;
-        let rect = PaintRect {
-            rect: rect.expand(0.5 * extrusion),
-            corner_radius: corner_radius + 0.5 * extrusion,
-            fill: color,
-            stroke: Default::default(),
-        };
+        let rect = RectShape::filled(
+            rect.expand(0.5 * extrusion),
+            corner_radius + 0.5 * extrusion,
+            color,
+        );
         let mut tessellator = Tessellator::from_options(TessellationOptions {
             aa_size: extrusion,
             anti_alias: true,

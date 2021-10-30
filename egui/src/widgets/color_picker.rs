@@ -1,5 +1,6 @@
 //! Color picker widgets.
 
+use crate::util::fixed_cache::FixedCache;
 use crate::*;
 use epaint::{color::*, *};
 
@@ -18,6 +19,9 @@ const N: u32 = 6 * 6;
 
 fn background_checkers(painter: &Painter, rect: Rect) {
     let rect = rect.shrink(0.5); // Small hack to avoid the checkers from peeking through the sides
+    if !rect.is_positive() {
+        return;
+    }
 
     let mut top_color = Color32::from_gray(128);
     let mut bottom_color = Color32::from_gray(32);
@@ -53,7 +57,7 @@ fn show_hsva(ui: &mut Ui, color: Hsva, desired_size: Vec2) -> Response {
         ui.painter().rect_filled(left, 0.0, color);
         ui.painter().rect_filled(right, 0.0, color.to_opaque());
     } else {
-        ui.painter().add(Shape::Rect {
+        ui.painter().add(RectShape {
             rect,
             corner_radius: 2.0,
             fill: color.into(),
@@ -63,11 +67,15 @@ fn show_hsva(ui: &mut Ui, color: Hsva, desired_size: Vec2) -> Response {
     response
 }
 
-fn color_button(ui: &mut Ui, color: Color32) -> Response {
+fn color_button(ui: &mut Ui, color: Color32, open: bool) -> Response {
     let size = ui.spacing().interact_size;
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
     response.widget_info(|| WidgetInfo::new(WidgetType::ColorButton));
-    let visuals = ui.style().interact(&response);
+    let visuals = if open {
+        &ui.visuals().widgets.open
+    } else {
+        ui.style().interact(&response)
+    };
     let rect = rect.expand(visuals.expansion);
 
     background_checkers(ui.painter(), rect);
@@ -79,7 +87,7 @@ fn color_button(ui: &mut Ui, color: Color32) -> Response {
 
     let corner_radius = visuals.corner_radius.at_most(2.0);
     ui.painter()
-        .rect_stroke(rect, corner_radius, (2.0, visuals.bg_fill)); // fill is intentional!
+        .rect_stroke(rect, corner_radius, (2.0, visuals.bg_fill)); // fill is intentional, because default style has no border
 
     response
 }
@@ -87,10 +95,7 @@ fn color_button(ui: &mut Ui, color: Color32) -> Response {
 fn color_slider_1d(ui: &mut Ui, value: &mut f32, color_at: impl Fn(f32) -> Color32) -> Response {
     #![allow(clippy::identity_op)]
 
-    let desired_size = vec2(
-        ui.spacing().slider_width,
-        ui.spacing().interact_size.y * 2.0,
-    );
+    let desired_size = vec2(ui.spacing().slider_width, ui.spacing().interact_size.y);
     let (rect, response) = ui.allocate_at_least(desired_size, Sense::click_and_drag());
 
     if let Some(mpos) = response.interact_pointer_pos() {
@@ -125,7 +130,7 @@ fn color_slider_1d(ui: &mut Ui, value: &mut f32, color_at: impl Fn(f32) -> Color
         let x = lerp(rect.left()..=rect.right(), *value);
         let r = rect.height() / 4.0;
         let picked_color = color_at(*value);
-        ui.painter().add(Shape::polygon(
+        ui.painter().add(Shape::convex_polygon(
             vec![
                 pos2(x - r, rect.bottom()),
                 pos2(x + r, rect.bottom()),
@@ -182,7 +187,7 @@ fn color_slider_2d(
     let x = lerp(rect.left()..=rect.right(), *x_value);
     let y = lerp(rect.bottom()..=rect.top(), *y_value);
     let picked_color = color_at(*x_value, *y_value);
-    ui.painter().add(Shape::Circle {
+    ui.painter().add(epaint::CircleShape {
         center: pos2(x, y),
         radius: rect.width() / 12.0,
         fill: picked_color,
@@ -203,23 +208,34 @@ pub enum Alpha {
     BlendOrAdditive,
 }
 
-fn color_text_ui(ui: &mut Ui, color: impl Into<Color32>) {
+fn color_text_ui(ui: &mut Ui, color: impl Into<Color32>, alpha: Alpha) {
     let color = color.into();
     ui.horizontal(|ui| {
         let [r, g, b, a] = color.to_array();
-        ui.label(format!(
-            "RGBA (premultiplied): rgba({}, {}, {}, {})",
-            r, g, b, a
-        ));
 
         if ui.button("📋").on_hover_text("Click to copy").clicked() {
-            ui.output().copied_text = format!("{}, {}, {}, {}", r, g, b, a);
+            if alpha == Alpha::Opaque {
+                ui.output().copied_text = format!("{}, {}, {}", r, g, b);
+            } else {
+                ui.output().copied_text = format!("{}, {}, {}, {}", r, g, b, a);
+            }
+        }
+
+        if alpha == Alpha::Opaque {
+            ui.label(format!("rgb({}, {}, {})", r, g, b))
+                .on_hover_text("Red Green Blue");
+        } else {
+            ui.label(format!("rgba({}, {}, {}, {})", r, g, b, a))
+                .on_hover_text("Red Green Blue with premultiplied Alpha");
         }
     });
 }
 
 fn color_picker_hsvag_2d(ui: &mut Ui, hsva: &mut HsvaGamma, alpha: Alpha) {
-    color_text_ui(ui, *hsva);
+    let current_color_size = vec2(ui.spacing().slider_width, ui.spacing().interact_size.y);
+    show_color(ui, *hsva, current_color_size).on_hover_text("Selected color");
+
+    color_text_ui(ui, *hsva, alpha);
 
     if alpha == Alpha::BlendOrAdditive {
         // We signal additive blending by storing a negative alpha (a bit ironic).
@@ -241,77 +257,53 @@ fn color_picker_hsvag_2d(ui: &mut Ui, hsva: &mut HsvaGamma, alpha: Alpha) {
     }
     let additive = hsva.a < 0.0;
 
-    // Using different grid ids avoid some flickering when switching between
-    // (the grid remembers the sizes of its contents).
-    let grid_id = if alpha == Alpha::Opaque {
-        "hsva_color_picker_opaque"
-    } else if additive {
-        "hsva_color_picker_additive"
+    let opaque = HsvaGamma { a: 1.0, ..*hsva };
+
+    if alpha == Alpha::Opaque {
+        hsva.a = 1.0;
     } else {
-        "hsva_color_picker_normal"
-    };
+        let a = &mut hsva.a;
 
-    crate::Grid::new(grid_id).show(ui, |ui| {
-        let current_color_size = vec2(
-            ui.spacing().slider_width,
-            ui.spacing().interact_size.y * 2.0,
-        );
-
-        let opaque = HsvaGamma { a: 1.0, ..*hsva };
-
-        if alpha == Alpha::Opaque {
-            hsva.a = 1.0;
-            show_color(ui, *hsva, current_color_size);
-            ui.label("Selected color");
-            ui.end_row();
-        } else {
-            let a = &mut hsva.a;
-
-            if alpha == Alpha::OnlyBlend {
-                if *a < 0.0 {
-                    *a = 0.5; // was additive, but isn't allowed to be
-                }
-                color_slider_1d(ui, a, |a| HsvaGamma { a, ..opaque }.into());
-                ui.label("Alpha");
-                ui.end_row();
-            } else if !additive {
-                color_slider_1d(ui, a, |a| HsvaGamma { a, ..opaque }.into());
-                ui.label("Alpha");
-                ui.end_row();
+        if alpha == Alpha::OnlyBlend {
+            if *a < 0.0 {
+                *a = 0.5; // was additive, but isn't allowed to be
             }
-
-            show_color(ui, *hsva, current_color_size);
-            ui.label("Selected color");
-            ui.end_row();
+            color_slider_1d(ui, a, |a| HsvaGamma { a, ..opaque }.into()).on_hover_text("Alpha");
+        } else if !additive {
+            color_slider_1d(ui, a, |a| HsvaGamma { a, ..opaque }.into()).on_hover_text("Alpha");
         }
+    }
 
-        ui.separator(); // TODO: fix ever-expansion
-        ui.end_row();
+    let HsvaGamma { h, s, v, a: _ } = hsva;
 
-        let HsvaGamma { h, s, v, a: _ } = hsva;
+    color_slider_1d(ui, h, |h| {
+        HsvaGamma {
+            h,
+            s: 1.0,
+            v: 1.0,
+            a: 1.0,
+        }
+        .into()
+    })
+    .on_hover_text("Hue");
 
-        color_slider_1d(ui, h, |h| HsvaGamma { h, ..opaque }.into());
-        ui.label("Hue");
-        ui.end_row();
+    if false {
+        color_slider_1d(ui, s, |s| HsvaGamma { s, ..opaque }.into()).on_hover_text("Saturation");
+    }
 
-        color_slider_1d(ui, s, |s| HsvaGamma { s, ..opaque }.into());
-        ui.label("Saturation");
-        ui.end_row();
+    if false {
+        color_slider_1d(ui, v, |v| HsvaGamma { v, ..opaque }.into()).on_hover_text("Value");
+    }
 
-        color_slider_1d(ui, v, |v| HsvaGamma { v, ..opaque }.into());
-        ui.label("Value");
-        ui.end_row();
-
-        color_slider_2d(ui, v, s, |v, s| HsvaGamma { v, s, ..opaque }.into());
-        ui.label("Value / Saturation");
-        ui.end_row();
-    });
+    color_slider_2d(ui, v, s, |v, s| HsvaGamma { s, v, ..opaque }.into());
 }
 
-/// return true on change
+/// Returns `true` on change.
 fn color_picker_hsva_2d(ui: &mut Ui, hsva: &mut Hsva, alpha: Alpha) -> bool {
     let mut hsvag = HsvaGamma::from(*hsva);
-    color_picker_hsvag_2d(ui, &mut hsvag, alpha);
+    ui.vertical(|ui| {
+        color_picker_hsvag_2d(ui, &mut hsvag, alpha);
+    });
     let new_hasva = Hsva::from(hsvag);
     if *hsva == new_hasva {
         false
@@ -321,9 +313,30 @@ fn color_picker_hsva_2d(ui: &mut Ui, hsva: &mut Hsva, alpha: Alpha) -> bool {
     }
 }
 
+/// Returns `true` on change.
+pub fn color_picker_color32(ui: &mut Ui, srgba: &mut Color32, alpha: Alpha) -> bool {
+    // To ensure we keep hue slider when `srgba` is gray we store the
+    // full `Hsva` in a cache:
+
+    let mut hsva = use_color_cache(ui.ctx(), |cc| cc.get(srgba).cloned())
+        .unwrap_or_else(|| Hsva::from(*srgba));
+
+    let response = color_picker_hsva_2d(ui, &mut hsva, alpha);
+
+    *srgba = Color32::from(hsva);
+
+    use_color_cache(ui.ctx(), |cc| cc.set(*srgba, hsva));
+
+    response
+}
+
 pub fn color_edit_button_hsva(ui: &mut Ui, hsva: &mut Hsva, alpha: Alpha) -> Response {
     let pupup_id = ui.auto_id_with("popup");
-    let mut button_response = color_button(ui, (*hsva).into()).on_hover_text("Click to edit color");
+    let open = ui.memory().is_popup_open(pupup_id);
+    let mut button_response = color_button(ui, (*hsva).into(), open);
+    if ui.style().explanation_tooltips {
+        button_response = button_response.on_hover_text("Click to edit color");
+    }
 
     if button_response.clicked() {
         ui.memory().toggle_popup(pupup_id);
@@ -334,13 +347,14 @@ pub fn color_edit_button_hsva(ui: &mut Ui, hsva: &mut Hsva, alpha: Alpha) -> Res
             .order(Order::Foreground)
             .default_pos(button_response.rect.max)
             .show(ui.ctx(), |ui| {
-                ui.spacing_mut().slider_width = 256.0;
+                ui.spacing_mut().slider_width = 210.0;
                 Frame::popup(ui.style()).show(ui, |ui| {
                     if color_picker_hsva_2d(ui, hsva, alpha) {
                         button_response.mark_changed();
                     }
-                })
-            });
+                });
+            })
+            .response;
 
         if !button_response.clicked()
             && (ui.input().key_pressed(Key::Escape) || area_response.clicked_elsewhere())
@@ -358,19 +372,18 @@ pub fn color_edit_button_srgba(ui: &mut Ui, srgba: &mut Color32, alpha: Alpha) -
     // To ensure we keep hue slider when `srgba` is gray we store the
     // full `Hsva` in a cache:
 
-    let mut hsva = ui
-        .ctx()
-        .memory()
-        .color_cache
-        .get(srgba)
-        .cloned()
+    let mut hsva = use_color_cache(ui.ctx(), |cc| cc.get(srgba).cloned())
         .unwrap_or_else(|| Hsva::from(*srgba));
 
     let response = color_edit_button_hsva(ui, &mut hsva, alpha);
 
     *srgba = Color32::from(hsva);
 
-    ui.ctx().memory().color_cache.set(*srgba, hsva);
+    use_color_cache(ui.ctx(), |cc| cc.set(*srgba, hsva));
 
     response
+}
+
+fn use_color_cache<R>(ctx: &Context, f: impl FnOnce(&mut FixedCache<Color32, Hsva>) -> R) -> R {
+    f(ctx.memory().data.get_temp_mut_or_default(Id::null()))
 }

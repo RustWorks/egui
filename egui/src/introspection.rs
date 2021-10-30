@@ -61,7 +61,7 @@ impl Widget for &mut epaint::text::FontDefinitions {
             for (text_style, (_family, size)) in self.family_and_size.iter_mut() {
                 // TODO: radio button for family
                 ui.add(
-                    Slider::f32(size, 4.0..=40.0)
+                    Slider::new(size, 4.0..=40.0)
                         .max_decimals(0)
                         .text(format!("{:?}", text_style)),
                 );
@@ -79,7 +79,7 @@ impl Widget for &epaint::stats::PaintStats {
                 "egui generates intermediate level shapes like circles and text. \
             These are later tessellated into triangles.",
             );
-            ui.advance_cursor(10.0);
+            ui.add_space(10.0);
 
             ui.style_mut().body_text_style = TextStyle::Monospace;
 
@@ -89,6 +89,8 @@ impl Widget for &epaint::stats::PaintStats {
                 shape_path,
                 shape_mesh,
                 shape_vec,
+                text_shape_vertices,
+                text_shape_indices,
                 clipped_meshes,
                 vertices,
                 indices,
@@ -96,18 +98,24 @@ impl Widget for &epaint::stats::PaintStats {
 
             ui.label("Intermediate:");
             label(ui, shapes, "shapes").on_hover_text("Boxes, circles, etc");
-            label(ui, shape_text, "text");
+            label(ui, shape_text, "text (mostly cached)");
             label(ui, shape_path, "paths");
             label(ui, shape_mesh, "nested meshes");
             label(ui, shape_vec, "nested shapes");
-            ui.advance_cursor(10.0);
+            ui.add_space(10.0);
 
-            ui.label("Tessellated:");
+            ui.label("Text shapes:");
+            label(ui, text_shape_vertices, "vertices");
+            label(ui, text_shape_indices, "indices")
+                .on_hover_text("Three 32-bit indices per triangles");
+            ui.add_space(10.0);
+
+            ui.label("Tessellated (and culled):");
             label(ui, clipped_meshes, "clipped_meshes")
                 .on_hover_text("Number of separate clip rectangles");
             label(ui, vertices, "vertices");
             label(ui, indices, "indices").on_hover_text("Three 32-bit indices per triangles");
-            ui.advance_cursor(10.0);
+            ui.add_space(10.0);
 
             // ui.label("Total:");
             // ui.label(self.total().format(""));
@@ -124,21 +132,29 @@ impl Widget for &mut epaint::TessellationOptions {
     fn ui(self, ui: &mut Ui) -> Response {
         ui.vertical(|ui| {
             let epaint::TessellationOptions {
+                pixels_per_point: _,
                 aa_size: _,
                 anti_alias,
                 coarse_tessellation_culling,
+                round_text_to_pixels,
                 debug_paint_clip_rects,
                 debug_paint_text_rects,
                 debug_ignore_clip_rects,
             } = self;
-            ui.checkbox(anti_alias, "Antialias");
-            ui.checkbox(
-                coarse_tessellation_culling,
-                "Do coarse culling in the tessellator",
-            );
-            ui.checkbox(debug_ignore_clip_rects, "Ignore clip rectangles (debug)");
-            ui.checkbox(debug_paint_clip_rects, "Paint clip rectangles (debug)");
-            ui.checkbox(debug_paint_text_rects, "Paint text bounds (debug)");
+            ui.checkbox(anti_alias, "Antialias")
+                .on_hover_text("Turn off for small performance gain.");
+            ui.collapsing("debug", |ui| {
+                ui.checkbox(
+                    coarse_tessellation_culling,
+                    "Do coarse culling in the tessellator",
+                );
+                ui.checkbox(round_text_to_pixels, "Align text positions to pixel grid")
+                    .on_hover_text("Most text already is, so don't expect to see a large change.");
+
+                ui.checkbox(debug_ignore_clip_rects, "Ignore clip rectangles");
+                ui.checkbox(debug_paint_clip_rects, "Paint clip rectangles");
+                ui.checkbox(debug_paint_text_rects, "Paint text bounds");
+            });
         })
         .response
     }

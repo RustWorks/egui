@@ -2,8 +2,8 @@ use egui::{containers::*, widgets::*, *};
 use std::f32::consts::TAU;
 
 #[derive(PartialEq)]
-#[cfg_attr(feature = "persistence", derive(serde::Deserialize, serde::Serialize))]
-#[cfg_attr(feature = "persistence", serde(default))]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(default))]
 pub struct FractalClock {
     paused: bool,
     time: f64,
@@ -37,10 +37,10 @@ impl epi::App for FractalClock {
         "🕑 Fractal Clock"
     }
 
-    fn update(&mut self, ctx: &egui::CtxRef, frame: &mut epi::Frame<'_>) {
+    fn update(&mut self, ctx: &egui::CtxRef, _frame: &mut epi::Frame<'_>) {
         egui::CentralPanel::default()
             .frame(Frame::dark_canvas(&ctx.style()))
-            .show(ctx, |ui| self.ui(ui, frame.info().seconds_since_midnight));
+            .show(ctx, |ui| self.ui(ui, crate::seconds_since_midnight()));
     }
 }
 
@@ -54,7 +54,7 @@ impl FractalClock {
         let painter = Painter::new(
             ui.ctx().clone(),
             ui.layer_id(),
-            ui.available_rect_before_wrap_finite(),
+            ui.available_rect_before_wrap(),
         );
         self.paint(&painter);
         // Make sure we allocate what we used (everything)
@@ -84,12 +84,12 @@ impl FractalClock {
         ui.label(format!("Painted line count: {}", self.line_count));
 
         ui.checkbox(&mut self.paused, "Paused");
-        ui.add(Slider::f32(&mut self.zoom, 0.0..=1.0).text("zoom"));
-        ui.add(Slider::f32(&mut self.start_line_width, 0.0..=5.0).text("Start line width"));
-        ui.add(Slider::usize(&mut self.depth, 0..=14).text("depth"));
-        ui.add(Slider::f32(&mut self.length_factor, 0.0..=1.0).text("length factor"));
-        ui.add(Slider::f32(&mut self.luminance_factor, 0.0..=1.0).text("luminance factor"));
-        ui.add(Slider::f32(&mut self.width_factor, 0.0..=1.0).text("width factor"));
+        ui.add(Slider::new(&mut self.zoom, 0.0..=1.0).text("zoom"));
+        ui.add(Slider::new(&mut self.start_line_width, 0.0..=5.0).text("Start line width"));
+        ui.add(Slider::new(&mut self.depth, 0..=14).text("depth"));
+        ui.add(Slider::new(&mut self.length_factor, 0.0..=1.0).text("length factor"));
+        ui.add(Slider::new(&mut self.luminance_factor, 0.0..=1.0).text("luminance factor"));
+        ui.add(Slider::new(&mut self.width_factor, 0.0..=1.0).text("width factor"));
 
         egui::reset_button(ui, self);
 

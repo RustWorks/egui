@@ -21,13 +21,14 @@ use super::*;
 /// egui::Window::new("My Window").show(ctx, |ui| {
 ///    ui.label("Hello World!");
 /// });
+#[must_use = "You should call .show()"]
 pub struct Window<'open> {
     title_label: Label,
     open: Option<&'open mut bool>,
     area: Area,
     frame: Option<Frame>,
     resize: Resize,
-    scroll: Option<ScrollArea>,
+    scroll: ScrollArea,
     collapsible: bool,
     with_title_bar: bool,
 }
@@ -36,8 +37,9 @@ impl<'open> Window<'open> {
     /// The window title is used as a unique [`Id`] and must be unique, and should not change.
     /// This is true even if you disable the title bar with `.title_bar(false)`.
     /// If you need a changing title, you must call `window.id(…)` with a fixed id.
-    pub fn new(title: impl Into<String>) -> Self {
-        let title = title.into();
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn new(title: impl ToString) -> Self {
+        let title = title.to_string();
         let area = Area::new(&title);
         let title_label = Label::new(title).text_style(TextStyle::Heading).wrap(false);
         Self {
@@ -49,7 +51,7 @@ impl<'open> Window<'open> {
                 .with_stroke(false)
                 .min_size([96.0, 32.0])
                 .default_size([340.0, 420.0]), // Default inner size of a window
-            scroll: None,
+            scroll: ScrollArea::neither(),
             collapsible: true,
             with_title_bar: true,
         }
@@ -77,14 +79,14 @@ impl<'open> Window<'open> {
         self
     }
 
-    /// Usage: `Window::new(...).mutate(|w| w.resize = w.resize.auto_expand_width(true))`
+    /// Usage: `Window::new(…).mutate(|w| w.resize = w.resize.auto_expand_width(true))`
     /// Not sure this is a good interface for this.
     pub fn mutate(mut self, mutate: impl Fn(&mut Self)) -> Self {
         mutate(&mut self);
         self
     }
 
-    /// Usage: `Window::new(...).resize(|r| r.auto_expand_width(true))`
+    /// Usage: `Window::new(…).resize(|r| r.auto_expand_width(true))`
     /// Not sure this is a good interface for this.
     pub fn resize(mut self, mutate: impl Fn(Resize) -> Resize) -> Self {
         self.resize = mutate(self.resize);
@@ -118,6 +120,22 @@ impl<'open> Window<'open> {
     /// Set initial position of the window.
     pub fn default_pos(mut self, default_pos: impl Into<Pos2>) -> Self {
         self.area = self.area.default_pos(default_pos);
+        self
+    }
+
+    /// Set anchor and distance.
+    ///
+    /// An anchor of `Align2::RIGHT_TOP` means "put the right-top corner of the window
+    /// in the right-top corner of the screen".
+    ///
+    /// The offset is added to the position, so e.g. an offset of `[-5.0, 5.0]`
+    /// would move the window left and down from the given anchor.
+    ///
+    /// Anchoring also makes the window immovable.
+    ///
+    /// It is an error to set both an anchor and a position.
+    pub fn anchor(mut self, align: Align2, offset: impl Into<Vec2>) -> Self {
+        self.area = self.area.anchor(align, offset);
         self
     }
 
@@ -185,24 +203,31 @@ impl<'open> Window<'open> {
     /// Text will not wrap, but will instead make your window width expand.
     pub fn auto_sized(mut self) -> Self {
         self.resize = self.resize.auto_sized();
-        self.scroll = None;
+        self.scroll = ScrollArea::neither();
         self
     }
 
-    /// Enable/disable scrolling. `false` by default.
-    pub fn scroll(mut self, scroll: bool) -> Self {
-        if scroll {
-            if self.scroll.is_none() {
-                self.scroll = Some(ScrollArea::auto_sized());
-            }
-            debug_assert!(
-                self.scroll.is_some(),
-                "Window::scroll called multiple times"
-            );
-        } else {
-            self.scroll = None;
-        }
+    /// Enable/disable horizontal/vertical scrolling. `false` by default.
+    pub fn scroll2(mut self, scroll: [bool; 2]) -> Self {
+        self.scroll = self.scroll.scroll2(scroll);
         self
+    }
+
+    /// Enable/disable horizontal scrolling. `false` by default.
+    pub fn hscroll(mut self, hscroll: bool) -> Self {
+        self.scroll = self.scroll.hscroll(hscroll);
+        self
+    }
+
+    /// Enable/disable vertical scrolling. `false` by default.
+    pub fn vscroll(mut self, vscroll: bool) -> Self {
+        self.scroll = self.scroll.vscroll(vscroll);
+        self
+    }
+
+    #[deprecated = "Use .vscroll(…) instead"]
+    pub fn scroll(self, scroll: bool) -> Self {
+        self.vscroll(scroll)
     }
 
     /// Constrain the area up to which the window can be dragged.
@@ -213,16 +238,22 @@ impl<'open> Window<'open> {
 }
 
 impl<'open> Window<'open> {
-    /// Returns `None` if the windows is not open (if [`Window::open`] was called with `&mut false`.
-    pub fn show(self, ctx: &CtxRef, add_contents: impl FnOnce(&mut Ui)) -> Option<Response> {
-        self.show_impl(ctx, Box::new(add_contents))
-    }
-
-    fn show_impl<'c>(
+    /// Returns `None` if the window is not open (if [`Window::open`] was called with `&mut false`).
+    /// Returns `Some(InnerResponse { inner: None })` if the window is collapsed.
+    #[inline]
+    pub fn show<R>(
         self,
         ctx: &CtxRef,
-        add_contents: Box<dyn FnOnce(&mut Ui) + 'c>,
-    ) -> Option<Response> {
+        add_contents: impl FnOnce(&mut Ui) -> R,
+    ) -> Option<InnerResponse<Option<R>>> {
+        self.show_dyn(ctx, Box::new(add_contents))
+    }
+
+    fn show_dyn<'c, R>(
+        self,
+        ctx: &CtxRef,
+        add_contents: Box<dyn FnOnce(&mut Ui) -> R + 'c>,
+    ) -> Option<InnerResponse<Option<R>>> {
         let Window {
             title_label,
             open,
@@ -248,14 +279,11 @@ impl<'open> Window<'open> {
         let resize_id = area_id.with("resize");
         let collapsing_id = area_id.with("collapsing");
 
-        let is_maximized = !with_title_bar
-            || collapsing_header::State::is_open(ctx, collapsing_id).unwrap_or_default();
-        let possible = PossibleInteractions {
-            movable: area.is_enabled() && area.is_movable(),
-            resizable: area.is_enabled() && resize.is_resizable() && is_maximized,
-        };
+        let is_collapsed = with_title_bar
+            && !collapsing_header::State::is_open(ctx, collapsing_id).unwrap_or_default();
+        let possible = PossibleInteractions::new(&area, &resize, is_collapsed);
 
-        let area = area.movable(false); // We move it manually
+        let area = area.movable(false); // We move it manually, or the area will move the window when we want to resize it
         let resize = resize.resizable(false); // We move it manually
         let mut resize = resize.id(resize_id);
 
@@ -265,7 +293,7 @@ impl<'open> Window<'open> {
 
         // First interact (move etc) to avoid frame delay:
         let last_frame_outer_rect = area.state().rect();
-        let interaction = if possible.movable || possible.resizable {
+        let interaction = if possible.movable || possible.resizable() {
             window_interaction(
                 ctx,
                 possible,
@@ -281,16 +309,14 @@ impl<'open> Window<'open> {
                     0.0
                 };
                 let margins = 2.0 * frame.margin + vec2(0.0, title_bar_height);
-                let bounds = area.drag_bounds();
 
                 interact(
                     window_interaction,
                     ctx,
                     margins,
                     area_layer_id,
-                    area.state_mut(),
+                    &mut area,
                     resize_id,
-                    bounds,
                 )
             })
         } else {
@@ -300,7 +326,7 @@ impl<'open> Window<'open> {
 
         let mut area_content_ui = area.content_ui(ctx);
 
-        {
+        let content_inner = {
             // BEGIN FRAME --------------------------------
             let frame_stroke = frame.stroke;
             let mut frame = frame.begin(&mut area_content_ui);
@@ -327,27 +353,24 @@ impl<'open> Window<'open> {
                 None
             };
 
-            let content_response = collapsing
+            let (content_inner, content_response) = collapsing
                 .add_contents(&mut frame.content_ui, collapsing_id, |ui| {
                     resize.show(ui, |ui| {
                         if title_bar.is_some() {
-                            ui.advance_cursor(title_content_spacing);
+                            ui.add_space(title_content_spacing);
                         }
 
-                        if let Some(scroll) = scroll {
-                            scroll.show(ui, add_contents);
+                        if scroll.has_any_bar() {
+                            scroll.show(ui, add_contents)
                         } else {
-                            add_contents(ui);
+                            add_contents(ui)
                         }
                     })
                 })
-                .map(|ir| ir.response);
+                .map_or((None, None), |ir| (Some(ir.inner), Some(ir.response)));
 
-            let outer_rect = frame.end(&mut area_content_ui);
-
-            if possible.resizable {
-                paint_resize_corner(&mut area_content_ui, outer_rect, frame_stroke);
-            }
+            let outer_rect = frame.end(&mut area_content_ui).rect;
+            paint_resize_corner(&mut area_content_ui, &possible, outer_rect, frame_stroke);
 
             // END FRAME --------------------------------
 
@@ -362,10 +385,7 @@ impl<'open> Window<'open> {
                 );
             }
 
-            area_content_ui
-                .memory()
-                .collapsing_headers
-                .insert(collapsing_id, collapsing);
+            collapsing.store(ctx, collapsing_id);
 
             if let Some(interaction) = interaction {
                 paint_frame_interaction(
@@ -384,19 +404,45 @@ impl<'open> Window<'open> {
                     );
                 }
             }
-        }
+            content_inner
+        };
+
+        area.state_mut().pos = ctx
+            .constrain_window_rect_to_area(area.state().rect(), area.drag_bounds())
+            .min;
+
         let full_response = area.end(ctx, area_content_ui);
 
-        Some(full_response)
+        let inner_response = InnerResponse {
+            inner: content_inner,
+            response: full_response,
+        };
+        Some(inner_response)
     }
 }
 
-fn paint_resize_corner(ui: &mut Ui, outer_rect: Rect, stroke: Stroke) {
+fn paint_resize_corner(
+    ui: &mut Ui,
+    possible: &PossibleInteractions,
+    outer_rect: Rect,
+    stroke: Stroke,
+) {
+    let corner = if possible.resize_right && possible.resize_bottom {
+        Align2::RIGHT_BOTTOM
+    } else if possible.resize_left && possible.resize_bottom {
+        Align2::LEFT_BOTTOM
+    } else if possible.resize_left && possible.resize_top {
+        Align2::LEFT_TOP
+    } else if possible.resize_right && possible.resize_top {
+        Align2::RIGHT_TOP
+    } else {
+        return;
+    };
+
     let corner_size = Vec2::splat(ui.visuals().resize_corner_size);
-    let handle_offset = -Vec2::splat(2.0);
-    let corner_rect =
-        Rect::from_min_size(outer_rect.max - corner_size + handle_offset, corner_size);
-    crate::resize::paint_resize_corner_with_style(ui, &corner_rect, stroke);
+    let corner_rect = corner.align_size_within_rect(corner_size, outer_rect);
+    let corner_rect = corner_rect.translate(-2.0 * corner.to_sign()); // move away from corner
+    crate::resize::paint_resize_corner_with_style(ui, &corner_rect, stroke, corner);
 }
 
 // ----------------------------------------------------------------------------
@@ -404,7 +450,30 @@ fn paint_resize_corner(ui: &mut Ui, outer_rect: Rect, stroke: Stroke) {
 #[derive(Clone, Copy, Debug)]
 struct PossibleInteractions {
     movable: bool,
-    resizable: bool,
+    // Which sides can we drag to resize?
+    resize_left: bool,
+    resize_right: bool,
+    resize_top: bool,
+    resize_bottom: bool,
+}
+
+impl PossibleInteractions {
+    fn new(area: &Area, resize: &Resize, is_collapsed: bool) -> Self {
+        let movable = area.is_enabled() && area.is_movable();
+        let resizable = area.is_enabled() && resize.is_resizable() && !is_collapsed;
+        let pivot = area.get_pivot();
+        Self {
+            movable,
+            resize_left: resizable && (movable || pivot.x() != Align::LEFT),
+            resize_right: resizable && (movable || pivot.x() != Align::RIGHT),
+            resize_top: resizable && (movable || pivot.y() != Align::TOP),
+            resize_bottom: resizable && (movable || pivot.y() != Align::BOTTOM),
+        }
+    }
+
+    pub fn resizable(&self) -> bool {
+        self.resize_left || self.resize_right || self.resize_top || self.resize_bottom
+    }
 }
 
 /// Either a move or resize
@@ -441,26 +510,22 @@ fn interact(
     ctx: &Context,
     margins: Vec2,
     area_layer_id: LayerId,
-    area_state: &mut area::State,
+    area: &mut area::Prepared,
     resize_id: Id,
-    drag_bounds: Option<Rect>,
 ) -> Option<WindowInteraction> {
     let new_rect = move_and_resize_window(ctx, &window_interaction)?;
     let new_rect = ctx.round_rect_to_pixels(new_rect);
 
-    let new_rect = if let Some(bounds) = drag_bounds {
-        ctx.constrain_window_rect_to_area(new_rect, bounds)
-    } else {
-        ctx.constrain_window_rect(new_rect)
-    };
+    let new_rect = ctx.constrain_window_rect_to_area(new_rect, area.drag_bounds());
 
     // TODO: add this to a Window state instead as a command "move here next frame"
-    area_state.pos = new_rect.min;
+    area.state_mut().pos = new_rect.min;
 
     if window_interaction.is_resize() {
-        let mut resize_state = ctx.memory().resize.get(&resize_id).cloned().unwrap();
-        resize_state.requested_size = Some(new_rect.size() - margins);
-        ctx.memory().resize.insert(resize_id, resize_state);
+        if let Some(mut state) = resize::State::load(ctx, resize_id) {
+            state.requested_size = Some(new_rect.size() - margins);
+            state.store(ctx, resize_id);
+        }
     }
 
     ctx.memory().areas.move_to_top(area_layer_id);
@@ -469,6 +534,12 @@ fn interact(
 
 fn move_and_resize_window(ctx: &Context, window_interaction: &WindowInteraction) -> Option<Rect> {
     window_interaction.set_cursor(ctx);
+
+    // Only move/resize windows with primary mouse button:
+    if !ctx.input().pointer.primary_down() {
+        return None;
+    }
+
     let pointer_pos = ctx.input().pointer.interact_pos()?;
     let mut rect = window_interaction.start_rect; // prevent drift
 
@@ -522,7 +593,7 @@ fn window_interaction(
     if window_interaction.is_none() {
         if let Some(hover_window_interaction) = resize_hover(ctx, possible, area_layer_id, rect) {
             hover_window_interaction.set_cursor(ctx);
-            if ctx.input().pointer.any_pressed() && ctx.input().pointer.any_down() {
+            if ctx.input().pointer.any_pressed() && ctx.input().pointer.primary_down() {
                 ctx.memory().interaction.drag_id = Some(id);
                 ctx.memory().interaction.drag_is_window = true;
                 window_interaction = Some(hover_window_interaction);
@@ -548,13 +619,13 @@ fn resize_hover(
     area_layer_id: LayerId,
     rect: Rect,
 ) -> Option<WindowInteraction> {
-    let pointer_pos = ctx.input().pointer.interact_pos()?;
+    let pointer = ctx.input().pointer.interact_pos()?;
 
     if ctx.input().pointer.any_down() && !ctx.input().pointer.any_pressed() {
         return None; // already dragging (something)
     }
 
-    if let Some(top_layer_id) = ctx.layer_id_at(pointer_pos) {
+    if let Some(top_layer_id) = ctx.layer_id_at(pointer) {
         if top_layer_id != area_layer_id && top_layer_id.order != Order::Background {
             return None; // Another window is on top here
         }
@@ -567,38 +638,45 @@ fn resize_hover(
 
     let side_grab_radius = ctx.style().interaction.resize_grab_radius_side;
     let corner_grab_radius = ctx.style().interaction.resize_grab_radius_corner;
-    if !rect.expand(side_grab_radius).contains(pointer_pos) {
+    if !rect.expand(side_grab_radius).contains(pointer) {
         return None;
     }
 
-    let (mut left, mut right, mut top, mut bottom) = Default::default();
-    if possible.resizable {
-        right = (rect.right() - pointer_pos.x).abs() <= side_grab_radius;
-        bottom = (rect.bottom() - pointer_pos.y).abs() <= side_grab_radius;
+    let mut left = possible.resize_left && (rect.left() - pointer.x).abs() <= side_grab_radius;
+    let mut right = possible.resize_right && (rect.right() - pointer.x).abs() <= side_grab_radius;
+    let mut top = possible.resize_top && (rect.top() - pointer.y).abs() <= side_grab_radius;
+    let mut bottom =
+        possible.resize_bottom && (rect.bottom() - pointer.y).abs() <= side_grab_radius;
 
-        if rect.right_bottom().distance(pointer_pos) < corner_grab_radius {
-            right = true;
-            bottom = true;
-        }
-
-        if possible.movable {
-            left = (rect.left() - pointer_pos.x).abs() <= side_grab_radius;
-            top = (rect.top() - pointer_pos.y).abs() <= side_grab_radius;
-
-            if rect.right_top().distance(pointer_pos) < corner_grab_radius {
-                right = true;
-                top = true;
-            }
-            if rect.left_top().distance(pointer_pos) < corner_grab_radius {
-                left = true;
-                top = true;
-            }
-            if rect.left_bottom().distance(pointer_pos) < corner_grab_radius {
-                left = true;
-                bottom = true;
-            }
-        }
+    if possible.resize_right
+        && possible.resize_bottom
+        && rect.right_bottom().distance(pointer) < corner_grab_radius
+    {
+        right = true;
+        bottom = true;
     }
+    if possible.resize_right
+        && possible.resize_top
+        && rect.right_top().distance(pointer) < corner_grab_radius
+    {
+        right = true;
+        top = true;
+    }
+    if possible.resize_left
+        && possible.resize_top
+        && rect.left_top().distance(pointer) < corner_grab_radius
+    {
+        left = true;
+        top = true;
+    }
+    if possible.resize_left
+        && possible.resize_bottom
+        && rect.left_bottom().distance(pointer) < corner_grab_radius
+    {
+        left = true;
+        bottom = true;
+    }
+
     let any_resize = left || right || top || bottom;
 
     if !any_resize && !possible.movable {
@@ -673,7 +751,7 @@ fn paint_frame_interaction(
 struct TitleBar {
     id: Id,
     title_label: Label,
-    title_galley: Galley,
+    title_galley: std::sync::Arc<Galley>,
     min_rect: Rect,
     rect: Rect,
 }
@@ -698,7 +776,7 @@ fn show_title_bar(
         let pad = (height - button_size.y) / 2.0; // calculated so that the icon is on the diagonal (if window padding is symmetrical)
 
         if collapsible {
-            ui.advance_cursor(pad);
+            ui.add_space(pad);
 
             let (_id, rect) = ui.allocate_space(button_size);
             let collapse_button_response = ui.interact(rect, collapsing_id, Sense::click());
@@ -713,9 +791,9 @@ fn show_title_bar(
 
         let minimum_width = if collapsible || show_close_button {
             // If at least one button is shown we make room for both buttons (since title is centered):
-            2.0 * (pad + button_size.x + item_spacing.x) + title_galley.size.x
+            2.0 * (pad + button_size.x + item_spacing.x) + title_galley.size().x
         } else {
-            pad + title_galley.size.x + pad
+            pad + title_galley.size().x + pad
         };
         let min_rect = Rect::from_min_size(ui.min_rect().min, vec2(minimum_width, height));
         let id = ui.advance_cursor_after_rect(min_rect);
@@ -764,10 +842,13 @@ impl TitleBar {
         self.title_label = self.title_label.text_color(style.fg_stroke.color);
 
         let full_top_rect = Rect::from_x_y_ranges(self.rect.x_range(), self.min_rect.y_range());
-        let text_pos = emath::align::center_size_in_rect(self.title_galley.size, full_top_rect);
-        let text_pos = text_pos.left_top() - 1.5 * Vec2::Y; // HACK: center on x-height of text (looks better)
+        let text_pos =
+            emath::align::center_size_in_rect(self.title_galley.size(), full_top_rect).left_top();
+        let text_pos = text_pos - self.title_galley.rect.min.to_vec2();
+        let text_pos = text_pos - 1.5 * Vec2::Y; // HACK: center on x-height of text (looks better)
+        let text_color = ui.visuals().text_color();
         self.title_label
-            .paint_galley(ui, text_pos, self.title_galley);
+            .paint_galley(ui, text_pos, self.title_galley, false, text_color);
 
         if let Some(content_response) = &content_response {
             // paint separator between title and content:

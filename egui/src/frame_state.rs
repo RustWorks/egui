@@ -1,5 +1,4 @@
 use crate::*;
-use epaint::ahash;
 
 /// State that is collected during a frame and then cleared.
 /// Short-term (single frame) memory.
@@ -7,7 +6,7 @@ use epaint::ahash;
 pub(crate) struct FrameState {
     /// All `Id`s that were used this frame.
     /// Used to debug `Id` clashes of widgets.
-    pub(crate) used_ids: ahash::AHashMap<Id, Pos2>,
+    pub(crate) used_ids: IdMap<Rect>,
 
     /// Starts off as the screen_rect, shrinks as panels are added.
     /// The `CentralPanel` does not change this.
@@ -24,11 +23,12 @@ pub(crate) struct FrameState {
     /// If a tooltip has been shown this frame, where was it?
     /// This is used to prevent multiple tooltips to cover each other.
     /// Initialized to `None` at the start of each frame.
-    pub(crate) tooltip_rect: Option<(Id, Rect)>,
+    pub(crate) tooltip_rect: Option<(Id, Rect, usize)>,
 
     /// Cleared by the first `ScrollArea` that makes use of it.
-    pub(crate) scroll_delta: Vec2,
-    pub(crate) scroll_target: Option<(f32, Align)>,
+    pub(crate) scroll_delta: Vec2, // TODO: move to a Mutex inside of `InputState` ?
+    /// horizontal, vertical
+    pub(crate) scroll_target: [Option<(f32, Align)>; 2],
 }
 
 impl Default for FrameState {
@@ -40,7 +40,7 @@ impl Default for FrameState {
             used_by_panels: Rect::NAN,
             tooltip_rect: None,
             scroll_delta: Vec2::ZERO,
-            scroll_target: None,
+            scroll_target: [None; 2],
         }
     }
 }
@@ -63,14 +63,14 @@ impl FrameState {
         *used_by_panels = Rect::NOTHING;
         *tooltip_rect = None;
         *scroll_delta = input.scroll_delta;
-        *scroll_target = None;
+        *scroll_target = [None; 2];
     }
 
     /// How much space is still available after panels has been added.
     /// This is the "background" area, what egui doesn't cover with panels (but may cover with windows).
     /// This is also the area to which windows are constrained.
     pub(crate) fn available_rect(&self) -> Rect {
-        debug_assert!(
+        crate::egui_assert!(
             self.available_rect.is_finite(),
             "Called `available_rect()` before `CtxRef::begin_frame()`"
         );
@@ -79,7 +79,7 @@ impl FrameState {
 
     /// Shrink `available_rect`.
     pub(crate) fn allocate_left_panel(&mut self, panel_rect: Rect) {
-        debug_assert!(
+        crate::egui_assert!(
             panel_rect.min.distance(self.available_rect.min) < 0.1,
             "Mismatching left panel. You must not create a panel from within another panel."
         );
@@ -89,13 +89,35 @@ impl FrameState {
     }
 
     /// Shrink `available_rect`.
+    pub(crate) fn allocate_right_panel(&mut self, panel_rect: Rect) {
+        crate::egui_assert!(
+            panel_rect.max.distance(self.available_rect.max) < 0.1,
+            "Mismatching right panel. You must not create a panel from within another panel."
+        );
+        self.available_rect.max.x = panel_rect.min.x;
+        self.unused_rect.max.x = panel_rect.min.x;
+        self.used_by_panels = self.used_by_panels.union(panel_rect);
+    }
+
+    /// Shrink `available_rect`.
     pub(crate) fn allocate_top_panel(&mut self, panel_rect: Rect) {
-        debug_assert!(
+        crate::egui_assert!(
             panel_rect.min.distance(self.available_rect.min) < 0.1,
             "Mismatching top panel. You must not create a panel from within another panel."
         );
         self.available_rect.min.y = panel_rect.max.y;
         self.unused_rect.min.y = panel_rect.max.y;
+        self.used_by_panels = self.used_by_panels.union(panel_rect);
+    }
+
+    /// Shrink `available_rect`.
+    pub(crate) fn allocate_bottom_panel(&mut self, panel_rect: Rect) {
+        crate::egui_assert!(
+            panel_rect.max.distance(self.available_rect.max) < 0.1,
+            "Mismatching bottom panel. You must not create a panel from within another panel."
+        );
+        self.available_rect.max.y = panel_rect.min.y;
+        self.unused_rect.max.y = panel_rect.min.y;
         self.used_by_panels = self.used_by_panels.union(panel_rect);
     }
 

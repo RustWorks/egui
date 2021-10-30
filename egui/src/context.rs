@@ -11,6 +11,7 @@ use crate::{
     frame_state::FrameState,
     input_state::*,
     layers::GraphicLayers,
+    menu::ContextMenuSystem,
     mutex::{Mutex, MutexGuard},
     *,
 };
@@ -58,7 +59,7 @@ impl std::ops::Deref for CtxRef {
     type Target = Context;
 
     fn deref(&self) -> &Context {
-        self.0.deref()
+        &*self.0
     }
 }
 
@@ -97,7 +98,7 @@ impl CtxRef {
     /// This will modify the internal reference to point to a new generation of [`Context`].
     /// Any old clones of this [`CtxRef`] will refer to the old [`Context`], which will not get new input.
     ///
-    /// Put your widgets into a [`SidePanel`], [`TopPanel`], [`CentralPanel`], [`Window`] or [`Area`].
+    /// Put your widgets into a [`SidePanel`], [`TopBottomPanel`], [`CentralPanel`], [`Window`] or [`Area`].
     pub fn begin_frame(&mut self, new_input: RawInput) {
         let mut self_: Context = (*self.0).clone();
         self_.begin_frame_mut(new_input);
@@ -108,11 +109,14 @@ impl CtxRef {
 
     /// If the given [`Id`] is not unique, an error will be printed at the given position.
     /// Call this for [`Id`]:s that need interaction or persistence.
-    pub(crate) fn register_interaction_id(&self, id: Id, new_pos: Pos2) {
-        let prev_pos = self.frame_state().used_ids.insert(id, new_pos);
-        if let Some(prev_pos) = prev_pos {
-            if prev_pos.distance(new_pos) < 0.1 {
-                // Likely same Widget being interacted with twice, which is fine.
+    pub(crate) fn register_interaction_id(&self, id: Id, new_rect: Rect) {
+        let prev_rect = self.frame_state().used_ids.insert(id, new_rect);
+        if let Some(prev_rect) = prev_rect {
+            // it is ok to reuse the same ID for e.g. a frame around a widget,
+            // or to check for interaction with the same widget twice:
+            if prev_rect.expand(0.1).contains_rect(new_rect)
+                || new_rect.expand(0.1).contains_rect(prev_rect)
+            {
                 return;
             }
 
@@ -123,7 +127,7 @@ impl CtxRef {
                     if rect.contains(pointer_pos) {
                         painter.error(
                             rect.left_bottom() + vec2(2.0, 4.0),
-                            "ID clashes happens when things like Windows or CollpasingHeaders share names,\n\
+                            "ID clashes happens when things like Windows or CollapsingHeaders share names,\n\
                              or when things like ScrollAreas and Resize areas aren't given unique id_source:s.",
                         );
                     }
@@ -132,14 +136,12 @@ impl CtxRef {
 
             let id_str = id.short_debug_format();
 
-            if prev_pos.distance(new_pos) < 4.0 {
-                show_error(new_pos, format!("Double use of ID {}", id_str));
+            if prev_rect.min.distance(new_rect.min) < 4.0 {
+                show_error(new_rect.min, format!("Double use of ID {}", id_str));
             } else {
-                show_error(prev_pos, format!("First use of ID {}", id_str));
-                show_error(new_pos, format!("Second use of ID {}", id_str));
+                show_error(prev_rect.min, format!("First use of ID {}", id_str));
+                show_error(new_rect.min, format!("Second use of ID {}", id_str));
             }
-
-            // TODO: a tooltip explaining this.
         }
     }
 
@@ -158,6 +160,8 @@ impl CtxRef {
         enabled: bool,
     ) -> Response {
         let gap = 0.5; // Just to make sure we don't accidentally hover two things at once (a small eps should be sufficient).
+
+        // Make it easier to click things:
         let interact_rect = rect.expand2(
             (0.5 * item_spacing - Vec2::splat(gap))
                 .at_least(Vec2::splat(0.0))
@@ -196,29 +200,33 @@ impl CtxRef {
             changed: false, // must be set by the widget itself
         };
 
+        let mut memory = self.memory();
+
         if !enabled || !sense.focusable || !layer_id.allow_interaction() {
             // Not interested or allowed input:
-            self.memory().surrender_focus(id);
+            memory.surrender_focus(id);
             return response;
         }
 
-        if sense.focusable {
-            self.memory().interested_in_focus(id);
+        // We only want to focus labels if the screen reader is on.
+        let interested_in_focus =
+            sense.interactive() || sense.focusable && memory.options.screen_reader;
+
+        if interested_in_focus {
+            memory.interested_in_focus(id);
         }
 
         if sense.click
-            && response.has_focus()
+            && memory.has_focus(response.id)
             && (self.input().key_pressed(Key::Space) || self.input().key_pressed(Key::Enter))
         {
             // Space/enter works like a primary click for e.g. selected buttons
             response.clicked[PointerButton::Primary as usize] = true;
         }
 
-        self.register_interaction_id(id, rect.min);
+        self.register_interaction_id(id, rect);
 
         if sense.click || sense.drag {
-            let mut memory = self.memory();
-
             memory.interaction.click_interest |= hovered && sense.click;
             memory.interaction.drag_interest |= hovered && sense.drag;
 
@@ -280,15 +288,31 @@ impl CtxRef {
             response.hovered &= response.is_pointer_button_down_on; // we don't hover widgets while interacting with *other* widgets
         }
 
-        if response.has_focus() && response.clicked_elsewhere() {
-            self.memory().surrender_focus(id);
+        if memory.has_focus(response.id) && response.clicked_elsewhere() {
+            memory.surrender_focus(id);
         }
 
         response
     }
 
+    /// Get a full-screen painter for a new or existing layer
+    pub fn layer_painter(&self, layer_id: LayerId) -> Painter {
+        Painter::new(self.clone(), layer_id, self.input.screen_rect())
+    }
+
+    /// Paint on top of everything else
     pub fn debug_painter(&self) -> Painter {
-        Painter::new(self.clone(), LayerId::debug(), self.input.screen_rect())
+        Self::layer_painter(self, LayerId::debug())
+    }
+
+    /// Respond to secondary clicks (right-clicks) by showing the given menu.
+    pub(crate) fn show_context_menu(
+        &self,
+        response: &Response,
+        add_contents: impl FnOnce(&mut Ui),
+    ) {
+        self.context_menu_system()
+            .context_menu(response, add_contents);
     }
 }
 
@@ -307,21 +331,27 @@ impl CtxRef {
 /// but you are likely the first person to try it.
 #[derive(Default)]
 pub struct Context {
+    // We clone the Context each frame so we can set a new `input`.
+    // This is so we can avoid a mutex lock to access the `InputState`.
+    // This means everything else needs to be behind an Arc.
+    // We can probably come up with a nicer design.
+    //
     /// None until first call to `begin_frame`.
     fonts: Option<Arc<Fonts>>,
     memory: Arc<Mutex<Memory>>,
     animation_manager: Arc<Mutex<AnimationManager>>,
+    context_menu_system: Arc<Mutex<ContextMenuSystem>>,
 
     input: InputState,
 
     /// State that is collected during a frame and then cleared
-    frame_state: Mutex<FrameState>,
+    frame_state: Arc<Mutex<FrameState>>,
 
     // The output of a frame:
-    graphics: Mutex<GraphicLayers>,
-    output: Mutex<Output>,
+    graphics: Arc<Mutex<GraphicLayers>>,
+    output: Arc<Mutex<Output>>,
 
-    paint_stats: Mutex<PaintStats>,
+    paint_stats: Arc<Mutex<PaintStats>>,
 
     /// While positive, keep requesting repaints. Decrement at the end of each frame.
     repaint_requests: AtomicU32,
@@ -339,17 +369,12 @@ impl Clone for Context {
             output: self.output.clone(),
             paint_stats: self.paint_stats.clone(),
             repaint_requests: self.repaint_requests.load(SeqCst).into(),
+            context_menu_system: self.context_menu_system.clone(),
         }
     }
 }
 
 impl Context {
-    #[allow(clippy::new_ret_no_self)]
-    #[deprecated = "Use CtxRef::default() instead"]
-    pub fn new() -> CtxRef {
-        CtxRef::default()
-    }
-
     /// How much space is still available after panels has been added.
     /// This is the "background" area, what egui doesn't cover with panels (but may cover with windows).
     /// This is also the area to which windows are constrained.
@@ -357,14 +382,21 @@ impl Context {
         self.frame_state.lock().available_rect()
     }
 
+    /// Stores all the egui state.
+    /// If you want to store/restore egui, serialize this.
     pub fn memory(&self) -> MutexGuard<'_, Memory> {
         self.memory.lock()
+    }
+
+    pub(crate) fn context_menu_system(&self) -> MutexGuard<'_, ContextMenuSystem> {
+        self.context_menu_system.lock()
     }
 
     pub(crate) fn graphics(&self) -> MutexGuard<'_, GraphicLayers> {
         self.graphics.lock()
     }
 
+    /// What egui outputs each frame.
     pub fn output(&self) -> MutexGuard<'_, Output> {
         self.output.lock()
     }
@@ -382,6 +414,7 @@ impl Context {
         self.repaint_requests.store(times_to_repaint, SeqCst);
     }
 
+    #[inline(always)]
     pub fn input(&self) -> &InputState {
         &self.input
     }
@@ -402,9 +435,21 @@ impl Context {
         self.fonts().texture()
     }
 
-    /// Will become active at the start of the next frame.
+    /// Tell `egui` which fonts to use.
+    ///
+    /// The default `egui` fonts only support latin and cyrillic alphabets,
+    /// but you can call this to install additional fonts that support e.g. korean characters.
+    ///
+    /// The new fonts will become active at the start of the next frame.
     pub fn set_fonts(&self, font_definitions: FontDefinitions) {
-        self.memory().options.font_definitions = font_definitions;
+        if let Some(current_fonts) = &self.fonts {
+            // NOTE: this comparison is expensive since it checks TTF data for equality
+            if current_fonts.definitions() == &font_definitions {
+                return; // no change - save us from reloading font textures
+            }
+        }
+
+        self.memory().new_font_definitions = Some(font_definitions);
     }
 
     /// The [`Style`] used by all subsequent windows, panels etc.
@@ -413,6 +458,8 @@ impl Context {
     }
 
     /// The [`Style`] used by all new windows, panels etc.
+    ///
+    /// You can also use [`Ui::style_mut`] to change the style of a single [`Ui`].
     ///
     /// Example:
     /// ```
@@ -439,6 +486,7 @@ impl Context {
     }
 
     /// The number of physical pixels for each logical point.
+    #[inline(always)]
     pub fn pixels_per_point(&self) -> f32 {
         self.input.pixels_per_point()
     }
@@ -449,6 +497,10 @@ impl Context {
     /// Note that this may be overwritten by input from the integration via [`RawInput::pixels_per_point`].
     /// For instance, when using `egui_web` the browsers native zoom level will always be used.
     pub fn set_pixels_per_point(&self, pixels_per_point: f32) {
+        if pixels_per_point != self.pixels_per_point() {
+            self.request_repaint();
+        }
+
         self.memory().new_pixels_per_point = Some(pixels_per_point);
     }
 
@@ -478,15 +530,12 @@ impl Context {
 
     // ---------------------------------------------------------------------
 
-    /// Constrain the position of a window/area
-    /// so it fits within the screen.
-    pub(crate) fn constrain_window_rect(&self, window: Rect) -> Rect {
-        self.constrain_window_rect_to_area(window, self.available_rect())
-    }
+    /// Constrain the position of a window/area so it fits within the provided boundary.
+    ///
+    /// If area is `None`, will constrain to [`Self::available_rect`].
+    pub(crate) fn constrain_window_rect_to_area(&self, window: Rect, area: Option<Rect>) -> Rect {
+        let mut area = area.unwrap_or_else(|| self.available_rect());
 
-    /// Constrain the position of a window/area
-    /// so it fits within the provided boundary.
-    pub(crate) fn constrain_window_rect_to_area(&self, window: Rect, mut area: Rect) -> Rect {
         if window.width() > area.width() {
             // Allow overlapping side bars.
             // This is important for small screens, e.g. mobiles running the web demo.
@@ -528,20 +577,29 @@ impl Context {
         self.input = input.begin_frame(new_raw_input);
         self.frame_state.lock().begin_frame(&self.input);
 
-        let font_definitions = self.memory().options.font_definitions.clone();
-        let pixels_per_point = self.input.pixels_per_point();
-        let same_as_current = match &self.fonts {
-            None => false,
-            Some(fonts) => {
-                *fonts.definitions() == font_definitions
-                    && (fonts.pixels_per_point() - pixels_per_point).abs() < 1e-3
+        {
+            // Load new fonts if required:
+            let new_font_definitions = self.memory().new_font_definitions.take();
+            let pixels_per_point = self.input.pixels_per_point();
+
+            let pixels_per_point_changed = match &self.fonts {
+                None => true,
+                Some(current_fonts) => {
+                    (current_fonts.pixels_per_point() - pixels_per_point).abs() > 1e-3
+                }
+            };
+
+            if self.fonts.is_none() || new_font_definitions.is_some() || pixels_per_point_changed {
+                self.fonts = Some(Arc::new(Fonts::new(
+                    pixels_per_point,
+                    new_font_definitions.unwrap_or_else(|| {
+                        self.fonts
+                            .as_ref()
+                            .map(|font| font.definitions().clone())
+                            .unwrap_or_default()
+                    }),
+                )));
             }
-        };
-        if !same_as_current {
-            self.fonts = Some(Arc::new(Fonts::from_definitions(
-                pixels_per_point,
-                font_definitions,
-            )));
         }
 
         // Ensure we register the background area so panels and background ui can catch clicks:
@@ -557,8 +615,8 @@ impl Context {
     }
 
     /// Call at the end of each frame.
-    /// Returns what has happened this frame (`Output`) as well as what you need to paint.
-    /// You can transform the returned shapes into triangles with a call to `Context::tessellate`.
+    /// Returns what has happened this frame [`crate::Output`] as well as what you need to paint.
+    /// You can transform the returned shapes into triangles with a call to [`Context::tessellate`].
     #[must_use]
     pub fn end_frame(&self) -> (Output, Vec<ClippedShape>) {
         if self.input.wants_repaint() {
@@ -567,6 +625,8 @@ impl Context {
 
         self.memory()
             .end_frame(&self.input, &self.frame_state().used_ids);
+
+        self.fonts().end_frame();
 
         let mut output: Output = std::mem::take(&mut self.output());
         if self.repaint_requests.load(SeqCst) > 0 {
@@ -585,11 +645,19 @@ impl Context {
 
     /// Tessellate the given shapes into triangle meshes.
     pub fn tessellate(&self, shapes: Vec<ClippedShape>) -> Vec<ClippedMesh> {
+        // A tempting optimization is to reuse the tessellation from last frame if the
+        // shapes are the same, but just comparing the shapes takes about 50% of the time
+        // it takes to tessellate them, so it is not a worth optimization.
+
         let mut tessellation_options = self.memory().options.tessellation_options;
+        tessellation_options.pixels_per_point = self.pixels_per_point();
         tessellation_options.aa_size = 1.0 / self.pixels_per_point();
-        let paint_stats = PaintStats::from_shapes(&shapes); // TODO: internal allocations
-        let clipped_meshes =
-            tessellator::tessellate_shapes(shapes, tessellation_options, self.fonts());
+        let paint_stats = PaintStats::from_shapes(&shapes);
+        let clipped_meshes = tessellator::tessellate_shapes(
+            shapes,
+            tessellation_options,
+            self.fonts().texture().size(),
+        );
         *self.paint_stats.lock() = paint_stats.with_clipped_meshes(&clipped_meshes);
         clipped_meshes
     }
@@ -645,16 +713,6 @@ impl Context {
         self.memory().interaction.is_using_pointer()
     }
 
-    #[deprecated = "Renamed wants_pointer_input"]
-    pub fn wants_mouse_input(&self) -> bool {
-        self.wants_pointer_input()
-    }
-
-    #[deprecated = "Renamed is_using_pointer"]
-    pub fn is_using_mouse(&self) -> bool {
-        self.is_using_pointer()
-    }
-
     /// If `true`, egui is currently listening on text input (e.g. typing text in a [`TextEdit`]).
     pub fn wants_keyboard_input(&self) -> bool {
         self.memory().interaction.focus.focused().is_some()
@@ -665,9 +723,12 @@ impl Context {
     /// Move all the graphics at the given layer.
     /// Can be used to implement drag-and-drop (see relevant demo).
     pub fn translate_layer(&self, layer_id: LayerId, delta: Vec2) {
-        self.graphics().list(layer_id).translate(delta);
+        if delta != Vec2::ZERO {
+            self.graphics().list(layer_id).lock().translate(delta);
+        }
     }
 
+    /// Top-most layer at the given position.
     pub fn layer_id_at(&self, pos: Pos2) -> Option<LayerId> {
         let resize_grab_radius_side = self.style().interaction.resize_grab_radius_side;
         self.memory().layer_id_at(pos, resize_grab_radius_side)
@@ -679,6 +740,20 @@ impl Context {
         } else {
             false
         }
+    }
+
+    // ---------------------------------------------------------------------
+
+    /// Wether or not to debug widget layout on hover.
+    pub fn debug_on_hover(&self) -> bool {
+        self.memory().options.style.debug.debug_on_hover
+    }
+
+    /// Turn on/off wether or not to debug widget layout on hover.
+    pub fn set_debug_on_hover(&self, debug_on_hover: bool) {
+        let mut style = (*self.memory().options.style).clone();
+        style.debug.debug_on_hover = debug_on_hover;
+        self.set_style(style);
     }
 }
 
@@ -734,12 +809,14 @@ impl Context {
             .show(ui, |ui| {
                 let mut tessellation_options = self.memory().options.tessellation_options;
                 tessellation_options.ui(ui);
+                ui.vertical_centered(|ui| reset_button(ui, &mut tessellation_options));
                 self.memory().options.tessellation_options = tessellation_options;
             });
     }
 
     pub fn inspection_ui(&self, ui: &mut Ui) {
         use crate::containers::*;
+        crate::trace!(ui);
 
         ui.label(format!("Is using pointer: {}", self.is_using_pointer()))
             .on_hover_text(
@@ -751,9 +828,9 @@ impl Context {
             "Wants keyboard input: {}",
             self.wants_keyboard_input()
         ))
-        .on_hover_text("Is egui currently listening for text input");
+        .on_hover_text("Is egui currently listening for text input?");
         ui.label(format!(
-            "keyboard focus widget: {}",
+            "Keyboard focus widget: {}",
             self.memory()
                 .interaction
                 .focus
@@ -762,8 +839,31 @@ impl Context {
                 .map(Id::short_debug_format)
                 .unwrap_or_default()
         ))
-        .on_hover_text("Is egui currently listening for text input");
-        ui.advance_cursor(16.0);
+        .on_hover_text("Is egui currently listening for text input?");
+
+        let pointer_pos = self
+            .input()
+            .pointer
+            .hover_pos()
+            .map_or_else(String::new, |pos| format!("{:?}", pos));
+        ui.label(format!("Pointer pos: {}", pointer_pos));
+
+        let top_layer = self
+            .input()
+            .pointer
+            .hover_pos()
+            .and_then(|pos| self.layer_id_at(pos))
+            .map_or_else(String::new, |layer| layer.short_debug_format());
+        ui.label(format!("Top layer under mouse: {}", top_layer));
+
+        ui.add_space(16.0);
+
+        ui.label(format!(
+            "There are {} text galleys in the layout cache",
+            self.fonts().num_galleys_in_cache()
+        ))
+        .on_hover_text("This is approximately the number of text strings on screen");
+        ui.add_space(16.0);
 
         CollapsingHeader::new("📥 Input")
             .default_open(false)
@@ -785,9 +885,16 @@ impl Context {
             *self.memory() = Default::default();
         }
 
+        let num_state = self.memory().data.len();
+        let num_serialized = self.memory().data.count_serialized();
+        ui.label(format!(
+            "{} widget states stored (of which {} are serialized).",
+            num_state, num_serialized
+        ));
+
         ui.horizontal(|ui| {
             ui.label(format!(
-                "{} areas (window positions)",
+                "{} areas (panels, windows, popups, …)",
                 self.memory().areas.count()
             ));
             if ui.button("Reset").clicked() {
@@ -795,18 +902,20 @@ impl Context {
             }
         });
         ui.indent("areas", |ui| {
+            ui.label("Visible areas, ordered back to front.");
+            ui.label("Hover to highlight");
             let layers_ids: Vec<LayerId> = self.memory().areas.order().to_vec();
             for layer_id in layers_ids {
                 let area = self.memory().areas.get(layer_id.id).cloned();
                 if let Some(area) = area {
                     let is_visible = self.memory().areas.is_visible(&layer_id);
+                    if !is_visible {
+                        continue;
+                    }
+                    let text = format!("{} - {:?}", layer_id.short_debug_format(), area.rect(),);
+                    // TODO: `Sense::hover_highlight()`
                     if ui
-                        .label(format!(
-                            "{:?} {:?} {}",
-                            layer_id.order,
-                            area.rect(),
-                            if is_visible { "" } else { "(INVISIBLE)" }
-                        ))
+                        .add(Label::new(text).monospace().sense(Sense::click()))
                         .hovered
                         && is_visible
                     {
@@ -821,31 +930,44 @@ impl Context {
         ui.horizontal(|ui| {
             ui.label(format!(
                 "{} collapsing headers",
-                self.memory().collapsing_headers.len()
+                self.memory()
+                    .data
+                    .count::<containers::collapsing_header::State>()
             ));
             if ui.button("Reset").clicked() {
-                self.memory().collapsing_headers = Default::default();
+                self.memory()
+                    .data
+                    .remove_by_type::<containers::collapsing_header::State>();
             }
         });
 
         ui.horizontal(|ui| {
-            ui.label(format!("{} menu bars", self.memory().menu_bar.len()));
+            ui.label(format!(
+                "{} menu bars",
+                self.memory().data.count::<menu::BarState>()
+            ));
             if ui.button("Reset").clicked() {
-                self.memory().menu_bar = Default::default();
+                self.memory().data.remove_by_type::<menu::BarState>();
             }
         });
 
         ui.horizontal(|ui| {
-            ui.label(format!("{} scroll areas", self.memory().scroll_areas.len()));
+            ui.label(format!(
+                "{} scroll areas",
+                self.memory().data.count::<scroll_area::State>()
+            ));
             if ui.button("Reset").clicked() {
-                self.memory().scroll_areas = Default::default();
+                self.memory().data.remove_by_type::<scroll_area::State>();
             }
         });
 
         ui.horizontal(|ui| {
-            ui.label(format!("{} resize areas", self.memory().resize.len()));
+            ui.label(format!(
+                "{} resize areas",
+                self.memory().data.count::<resize::State>()
+            ));
             if ui.button("Reset").clicked() {
-                self.memory().resize = Default::default();
+                self.memory().data.remove_by_type::<resize::State>();
             }
         });
 
