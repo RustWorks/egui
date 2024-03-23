@@ -2,13 +2,13 @@
 name: Feature request
 about: Suggest an idea for this project
 title: ''
-labels: enhancement
+labels: feature-request
 assignees: ''
 
 ---
 
 <!--
-First look if there is already a similar feature request. If there is, add a comment to it instead!
+First look if there is already a similar feature request. If there is, upvote the issue with 👍
 -->
 
 
