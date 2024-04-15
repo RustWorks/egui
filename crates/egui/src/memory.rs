@@ -185,6 +185,12 @@ pub struct Options {
     /// presses Cmd+Plus, Cmd+Minus or Cmd+0, just like in a browser.
     ///
     /// This is `true` by default.
+    ///
+    /// On the web-backend of `eframe` this is set to false by default,
+    /// so that the zoom shortcuts are handled exclusively by the browser,
+    /// which will change the `native_pixels_per_point` (`devicePixelRatio`).
+    /// You can still zoom egui independently by calling [`crate::Context::set_zoom_factor`],
+    /// which will be applied on top of the browsers global zoom.
     #[cfg_attr(feature = "serde", serde(skip))]
     pub zoom_with_keyboard: bool,
 
@@ -243,7 +249,7 @@ impl Options {
     pub fn ui(&mut self, ui: &mut crate::Ui) {
         let Self {
             style,          // covered above
-            zoom_factor: _, // TODO
+            zoom_factor: _, // TODO(emilk)
             zoom_with_keyboard,
             tessellation_options,
             repaint_on_widget_change,
@@ -278,13 +284,15 @@ impl Options {
             });
 
         CollapsingHeader::new("✒ Painting")
-            .default_open(true)
+            .default_open(false)
             .show(ui, |ui| {
                 tessellation_options.ui(ui);
-                ui.vertical_centered(|ui| crate::reset_button(ui, tessellation_options));
+                ui.vertical_centered(|ui| {
+                    crate::reset_button(ui, tessellation_options, "Reset paint settings");
+                });
             });
 
-        ui.vertical_centered(|ui| crate::reset_button(ui, self));
+        ui.vertical_centered(|ui| crate::reset_button(ui, self, "Reset all"));
     }
 }
 
